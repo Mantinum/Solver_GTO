@@ -1,0 +1,12 @@
+# Build directory
+build/
+
+# macOS specific
+.DS_Store
+
+# CMake user files
+CMakeUserPresets.json
+CMakePresets.json
+
+# VS Code specific
+.vscode/
