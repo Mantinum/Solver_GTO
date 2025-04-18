@@ -30,6 +30,16 @@ endif()
 add_subdirectory(${phevaluator_SOURCE_DIR}/cpp ${phevaluator_BINARY_DIR})
 # --- End Fetch PokerHandEvaluator ---
 
+# --- Fetch nlohmann/json (for JSON serialization) ---
+include(FetchContent)
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3 # Use a specific stable version
+)
+FetchContent_MakeAvailable(nlohmann_json)
+# --- End Fetch nlohmann/json ---
+
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -43,10 +53,13 @@ add_executable(gto_solver
         src/cfr_engine.cpp
         src/monte_carlo.cpp
 )
-# Link gto_solver against spdlog and the main phevaluator target
-target_link_libraries(gto_solver PRIVATE spdlog::spdlog pheval)
+# Link gto_solver against spdlog, phevaluator, and nlohmann_json
+target_link_libraries(gto_solver PRIVATE spdlog::spdlog pheval nlohmann_json::nlohmann_json)
 # Explicitly add phevaluator include directory
-target_include_directories(gto_solver PRIVATE ${phevaluator_SOURCE_DIR}/cpp/include)
+target_include_directories(gto_solver PRIVATE
+    ${phevaluator_SOURCE_DIR}/cpp/include
+    ${nlohmann_json_SOURCE_DIR}/include # Add include dir for nlohmann/json
+)
 
 install(TARGETS gto_solver DESTINATION bin)
 
@@ -103,8 +116,11 @@ add_executable(cfr_engine_test
         src/hand_evaluator.cpp
         # monte_carlo not needed for this basic test
 )
-# Link cfr_engine_test against gtest, spdlog and the main phevaluator target
-target_link_libraries(cfr_engine_test PRIVATE GTest::gtest GTest::gtest_main spdlog::spdlog pheval)
-# Explicitly add phevaluator include directory
-target_include_directories(cfr_engine_test PRIVATE ${phevaluator_SOURCE_DIR}/cpp/include)
+# Link cfr_engine_test against gtest, spdlog, phevaluator, and nlohmann_json
+target_link_libraries(cfr_engine_test PRIVATE GTest::gtest GTest::gtest_main spdlog::spdlog pheval nlohmann_json::nlohmann_json)
+# Explicitly add include directories
+target_include_directories(cfr_engine_test PRIVATE
+    ${phevaluator_SOURCE_DIR}/cpp/include
+    ${nlohmann_json_SOURCE_DIR}/include # Add include dir for nlohmann/json
+)
 gtest_discover_tests(cfr_engine_test)

@@ -5,7 +5,7 @@
 #include "action_abstraction.h" // Corrected include
 #include "hand_evaluator.h"   // Corrected include
 
-#include <iostream> // Keep for std::cerr fallback if spdlog fails? Or remove.
+#include <iostream>
 #include <vector>
 #include <map>
 #include <string>
@@ -18,9 +18,18 @@
 #include <thread>    // For std::thread
 #include <functional> // For std::bind or lambdas
 #include <mutex>     // For std::lock_guard
-#include <atomic>    // For std::atomic (already in node.h, but good practice)
+#include <atomic>    // For std::atomic
+#include <fstream>   // For file streams
+#include <filesystem> // For renaming files atomically (C++17)
 
+#include <nlohmann/json.hpp> // Include JSON library
 #include "spdlog/spdlog.h" // Include spdlog
+
+// Alias for convenience
+using json = nlohmann::json;
+
+// Define a simple version number for the checkpoint format (can be string now)
+const std::string CHECKPOINT_VERSION_JSON = "1.0-json";
 
 namespace gto_solver {
 
@@ -398,10 +407,31 @@ double CFREngine::cfr_plus_recursive(
 // --- Public Methods ---
 
 // Updated signature to accept game parameters and number of threads
-void CFREngine::train(int iterations, int num_players, int initial_stack, int ante_size, int num_threads) {
-    // --- Reset Counters ---
-    completed_iterations_ = 0;
-    total_nodes_created_ = 0; // Reset node count for this training run
+void CFREngine::train(int iterations, int num_players, int initial_stack, int ante_size, int num_threads, const std::string& save_filename, int checkpoint_interval, const std::string& load_filename) {
+    // --- Load Checkpoint if specified ---
+    int starting_iteration = 0;
+    if (!load_filename.empty()) {
+        spdlog::info("Attempting to load checkpoint from: {}", load_filename);
+        int loaded_iters = load_checkpoint(load_filename);
+        if (loaded_iters >= 0) {
+            starting_iteration = loaded_iters;
+            spdlog::info("Checkpoint loaded successfully. Resuming from iteration {}.", starting_iteration);
+        } else {
+            spdlog::warn("Failed to load checkpoint from {}. Starting training from scratch.", load_filename);
+        }
+    }
+
+    int iterations_to_run = iterations - starting_iteration;
+    if (iterations_to_run <= 0) {
+        spdlog::info("Target iterations ({}) already reached or exceeded by checkpoint ({}). No training needed.", iterations, starting_iteration);
+        return;
+    }
+     spdlog::info("Need to run {} more iterations.", iterations_to_run);
+
+
+    // --- Reset Counters (relative to loaded state) ---
+    completed_iterations_ = starting_iteration; // Start counting from loaded iteration
+    // total_nodes_created_ is loaded/updated within load_checkpoint or starts at 0
     last_logged_percent_ = -1; // Reset log tracker
 
     // --- Determine Number of Threads ---
@@ -426,18 +456,19 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
     // --- Thread Worker Function ---
     auto worker_task = [&](int thread_id, int iterations_for_thread) {
         // Thread-local RNG Initialization
-        unsigned seed = std::chrono::system_clock::now().time_since_epoch().count() + thread_id;
+        // Use a combination of time, thread_id, and starting_iteration for better seed diversity
+        unsigned seed = std::chrono::system_clock::now().time_since_epoch().count()
+                      + thread_id
+                      + starting_iteration; // Add starting iteration to seed
         std::mt19937 rng(seed);
 
         // Thread-local Deck Copy
         std::vector<Card> deck = master_deck;
+        int last_checkpoint_iter = 0; // Track iterations since last checkpoint for this thread
 
         for (int i = 0; i < iterations_for_thread; ++i) {
-            // Rotate button simple way for now - use global iteration count if needed for consistency,
-            // but simple modulo per thread is often sufficient for exploration.
-            // Let's use a global atomic counter for more consistent button rotation if desired,
-            // or just use local iteration 'i' for simplicity. Using 'i' for now.
-            int button_pos = (thread_id * iterations_for_thread + i) % num_players; // Approximate global iteration
+            int global_iteration_approx = starting_iteration + thread_id * iterations_for_thread + i; // Approximate global iteration
+            int button_pos = global_iteration_approx % num_players;
 
             // Create root state with specified parameters
             GameState root_state(num_players, initial_stack, ante_size, button_pos);
@@ -451,66 +482,94 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
             bool deal_ok = true;
             for (int p = 0; p < num_players; ++p) {
                 if (card_index + 1 >= deck.size()) {
-                    // This should ideally not happen with a standard 52-card deck and <= 23 players
                     spdlog::error("[Thread {}] Not enough cards in deck to deal hands. Index: {}, Deck size: {}", thread_id, card_index, deck.size());
                     deal_ok = false;
-                    break; // Stop dealing for this iteration
+                    break;
                 }
                 hands[p].push_back(deck[card_index++]);
                 hands[p].push_back(deck[card_index++]);
-                // Sort hands for consistent InfoSet keys
                 std::sort(hands[p].begin(), hands[p].end());
             }
 
             if (!deal_ok) {
-                continue; // Skip this iteration if dealing failed
+                continue;
             }
             root_state.deal_hands(hands);
 
-            // Logging progress (maybe log less frequently in multi-threaded)
-            // Increment completed iterations counter (atomic)
-            int current_completed = completed_iterations_++; // Post-increment returns old value, then increments
-
-            // --- Progress Logging (Thread 0 only, every 5%) ---
-            if (thread_id == 0) {
-                int current_percent = static_cast<int>((static_cast<double>(current_completed + 1) / iterations) * 100.0);
-                int last_logged = last_logged_percent_.load(); // Atomically load last logged value
-
-                // Log every 5% increment, ensuring we don't log the same percentage twice
-                if (current_percent >= last_logged + 5) {
-                    // Use compare_exchange_strong to ensure only one thread updates last_logged_percent_
-                    // for this percentage bracket.
-                    if (last_logged_percent_.compare_exchange_strong(last_logged, current_percent - (current_percent % 5))) {
-                         spdlog::info("Training progress: {}%", current_percent - (current_percent % 5));
-                    }
-                }
-                 // Ensure 100% is logged at the very end if needed (handled after join)
-            }
-
-
             // Run CFR+ from the root for each player
-            // card_index is now at the position after dealing hole cards
             for (int player = 0; player < num_players; ++player) {
                 std::vector<double> initial_reach_probs(num_players, 1.0);
-                int current_card_idx = card_index; // Store index before recursion for this player
+                int current_card_idx = card_index;
                 try {
                     cfr_plus_recursive(root_state, player, initial_reach_probs, deck, current_card_idx);
                 } catch (const std::exception& e) {
                      spdlog::error("[Thread {}] Exception in cfr_plus_recursive: {}", thread_id, e.what());
-                     // Decide how to handle: continue, break, rethrow? Continue for now.
                 }
-                // Note: current_card_idx is passed by reference and modified during recursion
             }
+
+            // Increment completed iterations counter (atomic)
+            int current_completed = completed_iterations_++; // Post-increment
+
+            // --- Progress Logging (Thread 0 only, every 5%) ---
+            if (thread_id == 0) {
+                // Calculate percentage based on total iterations requested, not just iterations_to_run
+                int current_percent = static_cast<int>((static_cast<double>(current_completed + 1) / iterations) * 100.0);
+                int last_logged = last_logged_percent_.load();
+
+                if (current_percent >= last_logged + 5) {
+                    // Use compare_exchange_strong to ensure only one thread updates last_logged_percent_
+                    // for this percentage bracket, rounding down to the nearest 5.
+                    int target_percent = current_percent - (current_percent % 5);
+                    if (target_percent > last_logged) { // Ensure we only log increasing percentages
+                         if (last_logged_percent_.compare_exchange_strong(last_logged, target_percent)) {
+                              spdlog::info("Training progress: {}%", target_percent);
+                         }
+                    }
+                }
+            }
+
+             // --- Checkpointing (Thread 0 only, based on GLOBAL iterations) ---
+             if (thread_id == 0 && !save_filename.empty() && checkpoint_interval > 0) {
+                 // Check if the *global* completed count crosses an interval boundary
+                 // Need to track the last iteration number when a save occurred.
+                 // (Requires update in .h file as well)
+
+                 // Simplified check for now: Check if current_completed is a multiple of interval
+                 // This might save slightly off the exact interval due to thread scheduling, but is simpler.
+                 // A more robust way involves tracking the last saved iteration count.
+                 // Let's try the simple modulo check first.
+                 int completed_count = current_completed + 1; // Use the count *after* this iteration finishes
+                 if (completed_count % checkpoint_interval == 0 && completed_count > 0) {
+                      spdlog::info("[Thread 0] Reached checkpoint interval (around iteration {}). Saving state...", completed_count);
+                     // Use a temporary filename + atomic rename for safety
+                     std::string temp_filename = save_filename + ".tmp";
+                     if (save_checkpoint(temp_filename)) {
+                         try {
+                             // Requires C++17 filesystem library
+                             std::filesystem::rename(temp_filename, save_filename);
+                             spdlog::info("[Thread 0] Checkpoint saved successfully to {}", save_filename);
+                         } catch (const std::filesystem::filesystem_error& fs_err) {
+                             spdlog::error("[Thread 0] Failed to rename temporary checkpoint file: {}", fs_err.what());
+                             // Attempt to remove temporary file if rename failed
+                             try { std::filesystem::remove(temp_filename); } catch(...) {}
+                         }
+                     } else {
+                         spdlog::error("[Thread 0] Failed to save checkpoint to temporary file {}", temp_filename);
+                     }
+                     // Note: We don't reset last_checkpoint_iter here as it's not used in this logic
+                 }
+             }
+
         } // End iteration loop for this thread
     }; // End lambda worker_task
 
     // --- Launch Threads ---
     std::vector<std::thread> threads;
-    int iterations_per_thread = iterations / threads_to_use;
-    int remaining_iterations = iterations % threads_to_use;
+    int iterations_per_thread = iterations_to_run / threads_to_use;
+    int remaining_iterations = iterations_to_run % threads_to_use;
 
     for (unsigned int i = 0; i < threads_to_use; ++i) {
-        int iters = iterations_per_thread + (i < remaining_iterations ? 1 : 0); // Distribute remainder
+        int iters = iterations_per_thread + (i < remaining_iterations ? 1 : 0);
         if (iters > 0) {
             threads.emplace_back(worker_task, i, iters);
         }
@@ -522,14 +581,183 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
             t.join();
         }
     }
-    // Ensure 100% completion is logged if it wasn't caught exactly by the 5% steps
-    if (last_logged_percent_.load() < 100) {
+
+    // --- Final Log & Save ---
+    // Ensure 100% is logged if the loop finished before the last 5% step triggered it
+    if (last_logged_percent_.load() < 100 && completed_iterations_.load() >= iterations) {
          spdlog::info("Training progress: 100%");
     }
+    spdlog::info("Training complete. Total iterations run: {}. Final iteration count: {}. Nodes created: {}", iterations_to_run, completed_iterations_.load(), total_nodes_created_.load());
 
-    // Use the atomic counter for total nodes created
-    spdlog::info("Training complete. Total iterations: {}. Nodes created: {}", iterations, total_nodes_created_.load());
+    // Final save if requested
+    if (!save_filename.empty()) {
+        spdlog::info("Performing final save to checkpoint file: {}", save_filename);
+        std::string temp_filename = save_filename + ".final.tmp";
+         if (save_checkpoint(temp_filename)) {
+             try {
+                 std::filesystem::rename(temp_filename, save_filename);
+                 spdlog::info("Final checkpoint saved successfully to {}", save_filename);
+             } catch (const std::filesystem::filesystem_error& fs_err) {
+                 spdlog::error("Failed to rename final temporary checkpoint file: {}", fs_err.what());
+                 try { std::filesystem::remove(temp_filename); } catch(...) {}
+             }
+         } else {
+             spdlog::error("Failed to save final checkpoint to temporary file {}", temp_filename);
+         }
+    }
 }
+
+// --- Checkpointing Methods ---
+
+// Save state to JSON file
+bool CFREngine::save_checkpoint(const std::string& filename) const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(node_map_mutex_)); // Lock for reading map
+
+    json checkpoint_data;
+    checkpoint_data["version"] = CHECKPOINT_VERSION_JSON;
+    checkpoint_data["completed_iterations"] = completed_iterations_.load();
+    checkpoint_data["total_nodes_created"] = total_nodes_created_.load();
+    checkpoint_data["node_map"] = node_map_; // nlohmann/json handles map<string, Node> via to_json
+
+    std::ofstream ofs(filename);
+    if (!ofs) {
+        spdlog::error("Failed to open checkpoint file for writing: {}", filename);
+        return false;
+    }
+
+    try {
+        // Use dump() without indentation for potentially lower memory usage during serialization
+        ofs << checkpoint_data.dump();
+        ofs.close();
+        return ofs.good();
+    } catch (const json::exception& e) {
+        spdlog::error("JSON serialization error during save: {}", e.what());
+        ofs.close();
+        return false;
+    } catch (const std::exception& e) {
+        spdlog::error("Standard exception during save: {}", e.what());
+        ofs.close();
+        return false;
+    }
+}
+
+// Load state from JSON file
+int CFREngine::load_checkpoint(const std::string& filename) {
+    std::lock_guard<std::mutex> lock(node_map_mutex_); // Lock for writing map
+
+    std::ifstream ifs(filename);
+    if (!ifs) {
+        spdlog::error("Failed to open checkpoint file for reading: {}", filename);
+        return -1;
+    }
+
+    json checkpoint_data;
+    int loaded_iterations = -1;
+    long long loaded_nodes_created = 0;
+
+    try {
+        ifs >> checkpoint_data; // Parse the entire JSON file
+        ifs.close();
+
+        // Version Check
+        if (!checkpoint_data.contains("version") || checkpoint_data["version"] != CHECKPOINT_VERSION_JSON) {
+            spdlog::error("Checkpoint file version mismatch or missing version. Expected: {}", CHECKPOINT_VERSION_JSON);
+            return -1;
+        }
+
+        // Completed Iterations
+        if (!checkpoint_data.contains("completed_iterations")) {
+             spdlog::error("Missing 'completed_iterations' in checkpoint.");
+             return -1;
+        }
+        loaded_iterations = checkpoint_data["completed_iterations"].get<int>();
+        if (loaded_iterations < 0) {
+             spdlog::error("Invalid 'completed_iterations' value in checkpoint.");
+             return -1;
+        }
+
+        // Total Nodes Created (Optional)
+        if (checkpoint_data.contains("total_nodes_created")) {
+            loaded_nodes_created = checkpoint_data["total_nodes_created"].get<long long>();
+        } else {
+             spdlog::warn("Missing 'total_nodes_created' in checkpoint. Will estimate.");
+             loaded_nodes_created = 0; // Will be updated below
+        }
+
+
+        // Node Map Data
+        if (!checkpoint_data.contains("node_map")) {
+             spdlog::error("Missing 'node_map' in checkpoint.");
+             return -1;
+        }
+
+        // --- Manually deserialize the node_map ---
+        node_map_.clear(); // Clear existing map
+        const json& node_map_json = checkpoint_data.at("node_map");
+        if (!node_map_json.is_object()) {
+             spdlog::error("'node_map' in checkpoint is not a JSON object.");
+             return -1;
+        }
+
+        for (auto it = node_map_json.begin(); it != node_map_json.end(); ++it) {
+            const std::string& key = it.key();
+            const json& node_json = it.value();
+            try {
+                // Create a default Node first (needs number of actions, which we don't have here!)
+                // --> Problem: We need the number of actions to construct a Node before calling from_json.
+                // --> Let's store num_actions within the Node JSON itself during save.
+
+                // --- TEMPORARY WORKAROUND (Assumes fixed number of actions, needs fix) ---
+                // This is incorrect if different nodes have different action counts!
+                // We need to store num_actions in the JSON.
+                // For now, let's assume a default or get it from the first loaded node if possible.
+                // This part needs refinement. Let's assume 6 actions for now as a placeholder.
+                size_t num_actions_placeholder = 6; // FIXME: This is wrong!
+                if (node_json.contains("regret_sum")) { // Get size from loaded data if possible
+                    num_actions_placeholder = node_json["regret_sum"].size();
+                }
+                Node node(num_actions_placeholder); // Create node with placeholder size
+                from_json(node_json, node); // Call our from_json function explicitly
+
+                // Use try_emplace which works with move-only types
+                node_map_.try_emplace(key, std::move(node));
+            } catch (const json::exception& e) {
+                 spdlog::error("Failed to deserialize node for key '{}': {}", key, e.what());
+                 return -1; // Stop loading on error
+            }
+        }
+        // --- End manual deserialization ---
+
+
+        // Update node count if it wasn't loaded or seems inconsistent
+        if (loaded_nodes_created == 0 || loaded_nodes_created != (long long)node_map_.size()) {
+             if (loaded_nodes_created != 0) { // Log warning only if value was present but different
+                 spdlog::warn("Loaded 'total_nodes_created' ({}) differs from loaded map size ({}). Using map size.", loaded_nodes_created, node_map_.size());
+             }
+             loaded_nodes_created = node_map_.size();
+        }
+
+        // Update atomic counters after successful load
+        completed_iterations_.store(loaded_iterations);
+        total_nodes_created_.store(loaded_nodes_created);
+
+        return loaded_iterations; // Return number of iterations loaded
+
+    } catch (const json::parse_error& e) {
+        spdlog::error("JSON parse error during load: {}", e.what());
+        if(ifs.is_open()) ifs.close();
+        return -1;
+    } catch (const json::exception& e) { // Catch other json exceptions (type errors, missing keys from .at())
+         spdlog::error("JSON exception during load: {}", e.what());
+         if(ifs.is_open()) ifs.close();
+         return -1;
+    } catch (const std::exception& e) {
+         spdlog::error("Standard exception during load: {}", e.what());
+         if(ifs.is_open()) ifs.close();
+         return -1;
+    }
+}
+
 
 std::vector<double> CFREngine::get_strategy(const std::string& info_set_key) {
     // Reading the strategy also needs protection if writes can happen concurrently

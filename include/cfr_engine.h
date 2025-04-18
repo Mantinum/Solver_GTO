@@ -10,6 +10,8 @@
 #include <thread> // For std::thread
 #include <mutex>  // For std::mutex
 #include <atomic> // For std::atomic
+#include <fstream> // For std::ofstream, std::ifstream
+#include <string> // Ensure string is included
 
 namespace gto_solver {
 
@@ -19,8 +21,12 @@ class CFREngine {
 public:
     CFREngine();
     // Modified train signature to accept game parameters and number of threads
-    void train(int iterations, int num_players, int initial_stack, int ante_size = 0, int num_threads = 1);
+    void train(int iterations, int num_players, int initial_stack, int ante_size = 0, int num_threads = 1, const std::string& save_filename = "", int checkpoint_interval = 0, const std::string& load_filename = "");
     std::vector<double> get_strategy(const std::string& info_set_key);
+
+    // Checkpointing methods
+    bool save_checkpoint(const std::string& filename) const;
+    int load_checkpoint(const std::string& filename); // Returns number of iterations loaded, or -1 on error
 
 private:
     NodeMap node_map_; // Stores regrets and strategies for each infoset

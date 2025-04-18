@@ -81,7 +81,7 @@ void display_strategy_grid(
                 const auto& strategy = strategies.at(hand_str);
                 if (!strategy.empty() && strategy.size() == legal_actions.size()) {
                     double max_prob = -1.0;
-                    size_t max_idx = -1;
+                    size_t max_idx = static_cast<size_t>(-1); // Initialize properly
                     // Find the index of the action with the highest probability
                     for(size_t k = 0; k < strategy.size(); ++k) {
                         if (strategy[k] > max_prob) {
@@ -116,8 +116,8 @@ void display_strategy_grid(
 
 
 // Function to parse command line arguments (simple version)
-// Added num_threads parameter
-void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& initial_stack, int& ante_size, int& num_threads) {
+// Added checkpoint parameters
+void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& initial_stack, int& ante_size, int& num_threads, std::string& save_file, int& checkpoint_interval, std::string& load_file) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-i" || arg == "--iterations") && i + 1 < argc) {
@@ -149,8 +149,20 @@ void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& 
                 num_threads = std::stoi(argv[++i]);
             } catch (const std::exception& e) {
                 spdlog::warn("Invalid value for num_threads: {}. Using default (hardware concurrency).", argv[i]);
-                num_threads = 0; // Use 0 to signify hardware concurrency default in engine
+                 num_threads = 0; // Use 0 to signify hardware concurrency default in engine
             }
+        } else if ((arg == "--save") && i + 1 < argc) {
+            save_file = argv[++i];
+        } else if ((arg == "--interval") && i + 1 < argc) {
+             try {
+                checkpoint_interval = std::stoi(argv[++i]);
+                if (checkpoint_interval < 0) checkpoint_interval = 0; // Ensure non-negative
+            } catch (const std::exception& e) {
+                spdlog::warn("Invalid value for checkpoint interval: {}. Disabling periodic saves.", argv[i]);
+                checkpoint_interval = 0;
+            }
+        } else if ((arg == "--load") && i + 1 < argc) {
+            load_file = argv[++i];
         }
          else {
             spdlog::warn("Unknown or incomplete argument: {}", arg);
@@ -166,6 +178,9 @@ int main(int argc, char* argv[]) { // Modified main signature
     int initial_stack = 100; // Default to 100BB
     int ante_size = 0; // Default to no ante
     int num_threads = 0; // Default to 0 (engine will use hardware_concurrency)
+    std::string save_file = ""; // Default: no saving
+    int checkpoint_interval = 0; // Default: no periodic saving (only final if save_file specified)
+    std::string load_file = ""; // Default: no loading
 
     // --- Setup Logging ---
     try {
@@ -189,9 +204,11 @@ int main(int argc, char* argv[]) { // Modified main signature
     spdlog::info("Starting GTO Solver");
 
     // --- Parse Arguments ---
-    parse_args(argc, argv, num_iterations, num_players, initial_stack, ante_size, num_threads);
+    parse_args(argc, argv, num_iterations, num_players, initial_stack, ante_size, num_threads, save_file, checkpoint_interval, load_file);
     spdlog::info("Configuration - Iterations: {}, Players: {}, Stack: {}, Ante: {}, Threads: {}",
                  num_iterations, num_players, initial_stack, ante_size, (num_threads <= 0 ? "Auto" : std::to_string(num_threads)));
+    if (!load_file.empty()) spdlog::info("Load Checkpoint: {}", load_file);
+    if (!save_file.empty()) spdlog::info("Save Checkpoint: {}, Interval: {} iters (0=final only)", save_file, checkpoint_interval);
 
 
     try {
@@ -206,10 +223,10 @@ int main(int argc, char* argv[]) { // Modified main signature
         spdlog::info("Modules initialized.");
 
         // --- Training ---
-        spdlog::info("Starting training for {} iterations...", num_iterations);
-        // Call train with parsed parameters, including num_threads
-        cfr_engine.train(num_iterations, num_players, initial_stack, ante_size, num_threads);
-        spdlog::info("Training finished.");
+        spdlog::info("Starting training for target {} iterations...", num_iterations);
+        // Call train with all parsed parameters
+        cfr_engine.train(num_iterations, num_players, initial_stack, ante_size, num_threads, save_file, checkpoint_interval, load_file);
+        // Note: "Training finished." log is now inside cfr_engine.train
 
         // --- Strategy Extraction and Display ---
         spdlog::info("--- Strategy Extraction ---");
@@ -236,7 +253,7 @@ int main(int argc, char* argv[]) { // Modified main signature
 
             spdlog::info("Strategy Profile (Hand: Action=Probability%):");
             // Use std::cout for potentially long output, format percentages
-            std::cout << std::fixed << std::setprecision(1); // 1 decimal place for percentage
+            // std::cout << std::fixed << std::setprecision(1); // 1 decimal place for percentage // Moved to grid display
 
             // Use a map to store strategies for the 169 canonical hand types
             std::map<std::string, std::vector<double>> canonical_strategies;
