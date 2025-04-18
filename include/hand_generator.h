@@ -2,6 +2,7 @@
 #define GTO_SOLVER_HAND_GENERATOR_H
 
 #include <vector>
+#include <string> // <-- Added missing include
 
 namespace gto_solver {
 
