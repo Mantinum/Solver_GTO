@@ -10,17 +10,19 @@
 #include <map>
 #include <string>
 #include <numeric>   // For std::accumulate
-#include <algorithm> // For std::max, std::shuffle, std::min
+#include <algorithm> // For std::max, std::shuffle, std::min, std::min_element, std::max_element
 #include <stdexcept> // For exceptions
 #include <random>    // For std::mt19937, std::random_device
 #include <chrono>    // For seeding RNG
-#include <utility>   // For std::pair
+#include <utility>   // For std::pair, std::move
 #include <thread>    // For std::thread
 #include <functional> // For std::bind or lambdas
-#include <mutex>     // For std::lock_guard
+#include <mutex>     // For std::lock_guard, std::scoped_lock
 #include <atomic>    // For std::atomic
 #include <fstream>   // For file streams
 #include <filesystem> // For renaming files atomically (C++17)
+#include <cmath>     // For std::isnan, std::isinf
+#include <memory>    // For std::unique_ptr, std::make_unique
 
 #include <nlohmann/json.hpp> // Include JSON library
 #include "spdlog/spdlog.h" // Include spdlog
@@ -28,28 +30,46 @@
 // Alias for convenience
 using json = nlohmann::json;
 
-// Define a simple version number for the checkpoint format (can be string now)
-const std::string CHECKPOINT_VERSION_JSON = "1.0-json";
+// Define a simple version number for the checkpoint format
+const std::string CHECKPOINT_VERSION_JSON = "1.1-json";
+
+namespace { // Anonymous namespace for helpers local to this file
+
+// Helper function to deserialize JSON data into an existing Node object
+// Assumes node is already constructed with the correct size based on num_actions read from JSON
+void from_json_node_helper(const json& j, gto_solver::Node& node) {
+    // No locking needed here as we operate on a temporary Node object before inserting into the map
+    j.at("regret_sum").get_to(node.regret_sum);
+    j.at("strategy_sum").get_to(node.strategy_sum);
+    // Optional: Verify sizes match the pre-constructed node's size
+    if (node.regret_sum.size() != node.strategy_sum.size() || node.regret_sum.size() != j.at("num_actions").get<size_t>()) {
+         throw std::runtime_error("Mismatch in vector sizes during JSON deserialization");
+     }
+    int visits = 0;
+    j.at("visit_count").get_to(visits);
+    node.visit_count.store(visits);
+}
+
+} // anonymous namespace
+
 
 namespace gto_solver {
 
 // --- Helper Function: Regret Matching ---
+// (remains the same)
 std::vector<double> get_strategy_from_regrets(const std::vector<double>& regrets) {
     size_t num_actions = regrets.size();
     std::vector<double> strategy(num_actions);
     double positive_regret_sum = 0.0;
-
     for (double regret : regrets) {
         positive_regret_sum += std::max(0.0, regret);
     }
-
     if (positive_regret_sum > 0) {
         for (size_t i = 0; i < num_actions; ++i) {
             strategy[i] = std::max(0.0, regrets[i]) / positive_regret_sum;
         }
     } else {
-        // Default to uniform strategy if no positive regrets
-        if (num_actions > 0) { // Avoid division by zero if num_actions is 0
+        if (num_actions > 0) {
              double uniform_prob = 1.0 / num_actions;
              std::fill(strategy.begin(), strategy.end(), uniform_prob);
         }
@@ -61,212 +81,134 @@ std::vector<double> get_strategy_from_regrets(const std::vector<double>& regrets
 // --- CFREngine Implementation ---
 
 CFREngine::CFREngine()
-    : node_map_(), // Initialize map
-      action_abstraction_(), // Initialize members
+    : node_map_(),
+      action_abstraction_(),
       hand_evaluator_()
 {
     spdlog::debug("CFREngine created");
 }
 
-// Recursive CFR+ function - updated signature
+// Recursive CFR+ function - uses node_ptr and node_mutex
 double CFREngine::cfr_plus_recursive(
     GameState current_state,
     int traversing_player,
-    const std::vector<double>& reach_probabilities, // P(player reaches state) for each player
-    std::vector<Card>& deck, // Pass deck by reference
-    int& card_idx           // Pass next card index by reference
+    const std::vector<double>& reach_probabilities,
+    std::vector<Card>& deck,
+    int& card_idx
 ) {
-    // --- 1. Check for Terminal State ---
-    Street entry_street = current_state.get_current_street(); // Store street at function entry
+    // (Terminal state logic remains the same)
+    Street entry_street = current_state.get_current_street();
     if (current_state.is_terminal()) {
-        // --- Payoff Calculation (Handles Multi-way with Side Pots) ---
         double final_payoff = 0.0;
         int num_players = current_state.get_num_players();
         std::vector<double> contributions(num_players);
         std::vector<bool> is_folded(num_players);
-        std::vector<int> showdown_players_indices; // Players involved in showdown
-
-        // 1. Gather initial data
+        std::vector<int> showdown_players_indices;
         double total_pot_size = 0.0;
         for (int i = 0; i < num_players; ++i) {
             contributions[i] = static_cast<double>(current_state.get_player_contribution(i));
             is_folded[i] = current_state.has_player_folded(i);
-            total_pot_size += contributions[i]; // Calculate total pot from contributions
-            if (!is_folded[i]) {
-                showdown_players_indices.push_back(i);
-            }
+            total_pot_size += contributions[i];
+            if (!is_folded[i]) showdown_players_indices.push_back(i);
         }
-
-        // If traversing player folded, their payoff is simply their negative contribution
-        if (is_folded[traversing_player]) {
-            final_payoff = -contributions[traversing_player];
-        }
-        // If only one player didn't fold, they win everything contributed by others
-        else if (showdown_players_indices.size() == 1) {
-             // The only remaining player must be the traversing_player (since they didn't fold)
-             final_payoff = total_pot_size - contributions[traversing_player];
-        }
-        // If multiple players reach showdown, calculate pots
+        if (is_folded[traversing_player]) final_payoff = -contributions[traversing_player];
+        else if (showdown_players_indices.size() == 1) final_payoff = total_pot_size - contributions[traversing_player];
         else if (showdown_players_indices.size() > 1) {
-            double total_winnings = 0.0; // Track winnings across all pots for traversing_player
-
-            // Create pairs of (contribution, player_index) for sorting showdown players
+            double total_winnings = 0.0;
             std::vector<std::pair<double, int>> sorted_players;
-            for (int index : showdown_players_indices) {
-                sorted_players.push_back({contributions[index], index});
-            }
+            for (int index : showdown_players_indices) sorted_players.push_back({contributions[index], index});
             std::sort(sorted_players.begin(), sorted_players.end());
-
             double last_contribution_level = 0.0;
-            std::vector<int> current_pot_eligible_players = showdown_players_indices; // Start with all showdown players
-
-            // 2. Iterate through contribution levels to create and distribute pots
+            std::vector<int> current_pot_eligible_players = showdown_players_indices;
             for (const auto& p : sorted_players) {
                 double current_contribution_level = p.first;
-                int player_at_this_level = p.second; // Player defining this contribution level
-
-                // If this player contributed more than the last level, create a pot for this increment
+                int player_at_this_level = p.second;
                 if (current_contribution_level > last_contribution_level && !current_pot_eligible_players.empty()) {
                     double pot_increment_per_player = current_contribution_level - last_contribution_level;
                     double current_pot_size = pot_increment_per_player * current_pot_eligible_players.size();
-
-                    // Evaluate hands ONLY for players eligible for THIS pot
                     std::vector<int> current_winners;
-                    int best_rank = 9999; // Lower is better
+                    int best_rank = 9999;
                     const auto& community_cards = current_state.get_community_cards();
-
-                    // Check board completion ONCE per pot calculation
                     bool board_complete = (community_cards.size() == 5);
-
                     if (board_complete) {
-                        std::vector<int> current_ranks(num_players, 9999); // Store ranks temporarily
+                        std::vector<int> current_ranks(num_players, 9999);
                         for (int eligible_player_index : current_pot_eligible_players) {
                              const auto& hand = current_state.get_player_hand(eligible_player_index);
                              if (hand.size() == 2) {
                                  current_ranks[eligible_player_index] = hand_evaluator_.evaluate_7_card_hand(hand, community_cards);
                                  best_rank = std::min(best_rank, current_ranks[eligible_player_index]);
                              } else {
-                                 spdlog::warn("Showdown occurred but player {} has invalid hand size {}. History: {}",
-                                              eligible_player_index, hand.size(), current_state.get_history_string());
-                                 current_ranks[eligible_player_index] = 9999; // Assign worst rank
+                                 spdlog::warn("Showdown occurred but player {} has invalid hand size {}. History: {}", eligible_player_index, hand.size(), current_state.get_history_string());
+                                 current_ranks[eligible_player_index] = 9999;
                              }
                         }
-                        // Identify winners for this specific pot
                         for (int eligible_player_index : current_pot_eligible_players) {
-                            if (current_ranks[eligible_player_index] == best_rank) {
-                                current_winners.push_back(eligible_player_index);
-                            }
+                            if (current_ranks[eligible_player_index] == best_rank) current_winners.push_back(eligible_player_index);
                         }
                     } else {
-                         // Board not complete - all eligible players split this pot segment
-                         spdlog::debug("Showdown before river ({} cards) for pot level {}. Splitting pot segment.",
-                                       community_cards.size(), current_contribution_level);
-                         current_winners = current_pot_eligible_players; // Everyone eligible splits
+                         spdlog::debug("Showdown before river ({} cards) for pot level {}. Splitting pot segment.", community_cards.size(), current_contribution_level);
+                         current_winners = current_pot_eligible_players;
                     }
-
-
-                    // Distribute the current pot segment
                     if (!current_winners.empty()) {
                         double share = current_pot_size / current_winners.size();
                         for (int winner_index : current_winners) {
-                            if (winner_index == traversing_player) {
-                                total_winnings += share;
-                            }
+                            if (winner_index == traversing_player) total_winnings += share;
                         }
                     }
-
                     last_contribution_level = current_contribution_level;
                 }
-
-                // Remove the player who defined this level from eligibility for the next side pot
-                // This needs to happen *after* processing the pot for their contribution level
                  auto it = std::remove(current_pot_eligible_players.begin(), current_pot_eligible_players.end(), player_at_this_level);
-                 if (it != current_pot_eligible_players.end()) { // Check if element was found before erasing
-                    current_pot_eligible_players.erase(it, current_pot_eligible_players.end());
-                 }
+                 if (it != current_pot_eligible_players.end()) current_pot_eligible_players.erase(it, current_pot_eligible_players.end());
             }
-
-            // Final payoff is total winnings minus initial contribution
             final_payoff = total_winnings - contributions[traversing_player];
-
         } else {
-             // Should not happen if is_terminal() is correct and >0 players started
              spdlog::error("Terminal state reached with 0 showdown players. History: {}", current_state.get_history_string());
              final_payoff = -contributions[traversing_player];
         }
-
-        // Return the calculated payoff for the traversing player
         return final_payoff;
     }
 
     // --- 2. Get InfoSet and Node ---
     int current_player = current_state.get_current_player();
      if (current_state.get_player_hand(current_player).empty()) {
-         // This can happen if a player folds and the state becomes terminal, but recursion continues one step.
-         // Or if hands weren't dealt properly.
          spdlog::debug("Player {} has no hand in non-terminal state (likely just folded). History: {}", current_player, current_state.get_history_string());
-         // If the state isn't actually terminal yet (e.g., waiting for others), this might be an error.
-         // However, returning 0 utility seems reasonable as this player path ends here.
          return 0.0;
      }
     InfoSet info_set(current_state.get_player_hand(current_player), current_state.get_history_string());
     std::string info_set_key = info_set.get_key();
 
-    // Get legal actions based on the current game state
     std::vector<std::string> legal_actions_str = action_abstraction_.get_possible_actions(current_state);
     size_t num_actions = legal_actions_str.size();
 
     if (num_actions == 0) {
-         // This might happen legitimately if a player is all-in and facing no bet, and action moves past them.
-         // Or if only one player remains un-folded but the state isn't marked terminal yet.
          spdlog::debug("No legal actions found for player {} in non-terminal state. History: {}", current_player, current_state.get_history_string());
-         // If no actions, utility from this point is 0 for the current player path.
-         // We need to continue recursion to find the actual terminal state payoff.
-         // This requires finding the *next* state without applying an action from current_player.
-         // This suggests a potential issue in the state transition logic (is_terminal or update_next_player).
-         // For now, let's assume the state *should* be terminal if no actions are possible.
-         // We calculate the payoff as if it were terminal.
-         // TODO: Re-evaluate this logic - should is_terminal catch this?
-         // Re-calculating payoff here duplicates terminal logic, let's return 0 and rely on caller/terminal check.
-         return 0.0; // No utility gained from this non-action state.
+         return 0.0;
     }
 
-    Node* node_ptr = nullptr; // Use pointer to avoid issues with map reallocation if needed, though unlikely here
-
+    Node* node_ptr = nullptr;
     // --- Thread-safe Node Lookup/Creation ---
-    { // Scope for the lock guard
+    {
         std::lock_guard<std::mutex> lock(node_map_mutex_);
         auto it = node_map_.find(info_set_key);
         if (it == node_map_.end()) {
-            // Node doesn't exist, create it
-            // Use emplace which constructs in-place, returns pair<iterator, bool>
-            auto emplace_result = node_map_.emplace(std::piecewise_construct,
-                                                   std::forward_as_tuple(info_set_key),
-                                                   std::forward_as_tuple(num_actions));
-            node_ptr = &emplace_result.first->second; // Get pointer to the newly created Node value in the map
-            total_nodes_created_++; // Increment atomic counter
+            auto emplace_result = node_map_.emplace(info_set_key, std::make_unique<Node>(num_actions));
+            node_ptr = emplace_result.first->second.get();
+            total_nodes_created_++;
         } else {
-            // Node exists
-            node_ptr = &it->second; // Get pointer to the existing Node value
+            node_ptr = it->second.get();
         }
-    } // Mutex is released here
-
-    // Ensure node_ptr is valid before dereferencing
-    if (!node_ptr) {
-         spdlog::error("Failed to get or create node for key: {}", info_set_key);
-         // Decide how to handle this critical error. Throwing might be appropriate.
-         throw std::runtime_error("Failed to get or create node for key: " + info_set_key);
     }
-    Node& node = *node_ptr; // Dereference the pointer to get the Node reference
+
+    if (!node_ptr) {
+         spdlog::error("Failed to get or create node pointer for key: {}", info_set_key);
+         throw std::runtime_error("Failed to get or create node pointer for key: " + info_set_key);
+    }
 
     // --- 3. Calculate Current Strategy (Regret Matching) ---
-    // Read regret_sum - potentially needs protection if updates are not atomic per element
-    // For simplicity with std::vector<double>, we lock before reading strategy/regrets
-    // and before writing them.
     std::vector<double> current_regrets;
     {
-        std::lock_guard<std::mutex> lock(node_map_mutex_);
-        current_regrets = node.regret_sum; // Copy regrets under lock
+        std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex); // Lock specific node
+        current_regrets = node_ptr->regret_sum;
     }
     std::vector<double> current_strategy = get_strategy_from_regrets(current_regrets);
 
@@ -277,33 +219,19 @@ double CFREngine::cfr_plus_recursive(
     for (size_t i = 0; i < num_actions; ++i) {
         Action action;
         const std::string& action_str = legal_actions_str[i];
-        // Assign player index to action BEFORE applying it
         action.player_index = current_player;
 
-        if (action_str == "fold") {
-            action.type = Action::Type::FOLD;
-        } else if (action_str == "call") {
-            action.type = Action::Type::CALL;
-        } else if (action_str == "check") {
-             action.type = Action::Type::CHECK;
-             action.amount = 0; // Ensure amount is 0 for check
-        } else if (action_str.find("raise") != std::string::npos || action_str.find("bet") != std::string::npos || action_str == "all_in") {
-             if (current_state.get_amount_to_call(current_player) == 0) {
-                 action.type = Action::Type::BET;
-             } else {
-                 action.type = Action::Type::RAISE;
-             }
+        // (Action parsing logic remains the same)
+        if (action_str == "fold") { action.type = Action::Type::FOLD; }
+        else if (action_str == "call") { action.type = Action::Type::CALL; }
+        else if (action_str == "check") { action.type = Action::Type::CHECK; action.amount = 0; }
+        else if (action_str.find("raise") != std::string::npos || action_str.find("bet") != std::string::npos || action_str == "all_in") {
+             action.type = (current_state.get_amount_to_call(current_player) == 0) ? Action::Type::BET : Action::Type::RAISE;
              action.amount = action_abstraction_.get_action_amount(action_str, current_state);
-             if (action.amount == -1) {
-                  spdlog::error("Could not determine amount for action: {} in state {}", action_str, current_state.get_history_string());
-                  // Skip this invalid action path
-                  action_utilities[i] = -1e18; // Assign very low utility? Or just skip update? Skip for now.
-                  continue;
-             }
-        }
-         else {
-             spdlog::error("Unsupported action string from get_possible_actions: {}", action_str);
-             throw std::logic_error("Unsupported action string from get_possible_actions: " + action_str);
+             if (action.amount == -1) { continue; }
+        } else {
+             spdlog::error("Unsupported action string: {}", action_str);
+             throw std::logic_error("Unsupported action string: " + action_str);
         }
 
         GameState next_state = current_state;
@@ -311,13 +239,12 @@ double CFREngine::cfr_plus_recursive(
              next_state.apply_action(action);
         } catch (const std::exception& e) {
              spdlog::warn("Exception applying action '{}' in state {}. Skipping. Error: {}", action_str, current_state.get_history_string(), e.what());
-             action_utilities[i] = -1e18; // Assign very low utility? Or just skip update? Skip for now.
              continue;
         }
 
-        // --- Deal community cards if street changed ---
+        // (Community card dealing logic remains the same)
         Street next_street = next_state.get_current_street();
-        int current_card_idx = card_idx; // Store current index before recursive call
+        int current_card_idx = card_idx;
         if (next_street != entry_street && next_street != Street::SHOWDOWN) {
             std::vector<Card> cards_to_deal;
             int num_cards_to_deal = 0;
@@ -327,46 +254,27 @@ double CFREngine::cfr_plus_recursive(
 
             if (num_cards_to_deal > 0) {
                 if (card_idx + num_cards_to_deal <= deck.size()) {
-                    for(int k=0; k<num_cards_to_deal; ++k) {
-                        cards_to_deal.push_back(deck[card_idx++]);
-                    }
+                    for(int k=0; k<num_cards_to_deal; ++k) cards_to_deal.push_back(deck[card_idx++]);
                     next_state.deal_community_cards(cards_to_deal);
                 } else {
                     spdlog::error("Not enough cards left in deck to deal {} for {}. Deck size: {}, Card index: {}",
                                   num_cards_to_deal, static_cast<int>(next_street), deck.size(), card_idx);
-                    // Handle error - maybe return 0 utility or throw?
-                    action_utilities[i] = 0.0; // Assign 0 utility for this path
-                    card_idx = current_card_idx; // Restore card index
-                    continue; // Skip recursion for this invalid state
+                    card_idx = current_card_idx; continue;
                 }
             }
         }
-        // --- End Deal community cards ---
 
         std::vector<double> next_reach_probabilities = reach_probabilities;
-        // Only update opponent reach probability if it's their turn
         if(current_player != traversing_player) {
              next_reach_probabilities[current_player] *= current_strategy[i];
         }
 
-
-        // Recursive call - negate result as it's from opponent's perspective relative to this node
-        action_utilities[i] = -cfr_plus_recursive(
-            next_state,
-            traversing_player,
-            next_reach_probabilities,
-            deck,
-            card_idx // Pass updated index
-        );
-
-        // Restore card index after recursive call returns, so sibling nodes use correct index
+        action_utilities[i] = -cfr_plus_recursive(next_state, traversing_player, next_reach_probabilities, deck, card_idx);
         card_idx = current_card_idx;
-
         node_utility += current_strategy[i] * action_utilities[i];
     }
 
     // --- 5. Update Regrets & Strategy Sum (CFR+ specific updates) ---
-    // Only update regrets and strategy sum if it's the traversing player's turn to act
     if (current_player == traversing_player) {
         double counterfactual_reach_prob = 1.0;
         for(int p = 0; p < current_state.get_num_players(); ++p) {
@@ -375,29 +283,32 @@ double CFREngine::cfr_plus_recursive(
             }
         }
 
-        // --- Thread-safe Update of Regrets & Strategy Sum ---
-        { // Scope for the lock guard
-            std::lock_guard<std::mutex> lock(node_map_mutex_);
-
-            // Ensure counterfactual_reach_prob is not zero or too small to avoid issues
+        // Lock the specific node's mutex to update its sums
+        {
+            std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex); // Use node_ptr
             if (counterfactual_reach_prob > 1e-9) {
                  for (size_t i = 0; i < num_actions; ++i) {
                      double regret = action_utilities[i] - node_utility;
-                     node.regret_sum[i] += counterfactual_reach_prob * regret;
+                     if (!std::isnan(regret) && !std::isinf(regret)) {
+                        node_ptr->regret_sum[i] += counterfactual_reach_prob * regret;
+                     } else {
+                        spdlog::warn("Invalid regret calculated for action {} in node {}: {}", i, info_set_key, regret);
+                     }
                  }
             }
-
             double player_reach_prob = reach_probabilities[current_player];
-             // Ensure player_reach_prob is not zero or too small
              if (player_reach_prob > 1e-9) {
                  for (size_t i = 0; i < num_actions; ++i) {
-                     node.strategy_sum[i] += player_reach_prob * current_strategy[i];
+                     if (!std::isnan(current_strategy[i]) && !std::isinf(current_strategy[i])) {
+                        node_ptr->strategy_sum[i] += player_reach_prob * current_strategy[i];
+                     } else {
+                         spdlog::warn("Invalid strategy value calculated for action {} in node {}: {}", i, info_set_key, current_strategy[i]);
+                     }
                  }
              }
-        } // Mutex is released here
+        } // Node mutex released
 
-        // visit_count is atomic, can be incremented outside the lock
-        node.visit_count++;
+        node_ptr->visit_count++; // Atomic increment
     }
 
     return node_utility;
@@ -430,16 +341,14 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
 
 
     // --- Reset Counters (relative to loaded state) ---
-    completed_iterations_ = starting_iteration; // Start counting from loaded iteration
-    // total_nodes_created_ is loaded/updated within load_checkpoint or starts at 0
-    last_logged_percent_ = -1; // Reset log tracker
+    completed_iterations_ = starting_iteration;
+    if (starting_iteration == 0) total_nodes_created_ = 0;
+    last_logged_percent_ = -1;
 
     // --- Determine Number of Threads ---
     unsigned int hardware_threads = std::thread::hardware_concurrency();
     unsigned int threads_to_use = (num_threads <= 0) ? hardware_threads : std::min((unsigned int)num_threads, hardware_threads);
-    if (threads_to_use == 0) { // hardware_concurrency might return 0
-        threads_to_use = 1;
-    }
+    if (threads_to_use == 0) threads_to_use = 1;
     spdlog::info("Using {} threads for training.", threads_to_use);
 
     // --- Deck Initialization (Master Deck) ---
@@ -448,55 +357,42 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
     const std::vector<char> suits = {'c', 'd', 'h', 's'};
     for (char r : ranks) {
         for (char s : suits) {
-            // Use string directly as Card is std::string
             master_deck.push_back(std::string(1, r) + s);
         }
     }
 
     // --- Thread Worker Function ---
     auto worker_task = [&](int thread_id, int iterations_for_thread) {
-        // Thread-local RNG Initialization
-        // Use a combination of time, thread_id, and starting_iteration for better seed diversity
         unsigned seed = std::chrono::system_clock::now().time_since_epoch().count()
-                      + thread_id
-                      + starting_iteration; // Add starting iteration to seed
+                      + thread_id + starting_iteration;
         std::mt19937 rng(seed);
-
-        // Thread-local Deck Copy
         std::vector<Card> deck = master_deck;
-        int last_checkpoint_iter = 0; // Track iterations since last checkpoint for this thread
+        int last_checkpoint_iter_count = starting_iteration / checkpoint_interval; // Initialize based on starting iter
 
         for (int i = 0; i < iterations_for_thread; ++i) {
-            int global_iteration_approx = starting_iteration + thread_id * iterations_for_thread + i; // Approximate global iteration
+            int global_iteration_approx = starting_iteration + completed_iterations_.load();
             int button_pos = global_iteration_approx % num_players;
 
-            // Create root state with specified parameters
             GameState root_state(num_players, initial_stack, ante_size, button_pos);
-
-            // Shuffle deck for this iteration (thread-local copy)
             std::shuffle(deck.begin(), deck.end(), rng);
 
             // Deal hands
             std::vector<std::vector<Card>> hands(num_players);
-            int card_index = 0; // Index for drawing from the shuffled deck
+            int card_index = 0;
             bool deal_ok = true;
             for (int p = 0; p < num_players; ++p) {
                 if (card_index + 1 >= deck.size()) {
-                    spdlog::error("[Thread {}] Not enough cards in deck to deal hands. Index: {}, Deck size: {}", thread_id, card_index, deck.size());
-                    deal_ok = false;
-                    break;
+                    spdlog::error("[Thread {}] Not enough cards to deal hands. Index: {}, Deck size: {}", thread_id, card_index, deck.size());
+                    deal_ok = false; break;
                 }
                 hands[p].push_back(deck[card_index++]);
                 hands[p].push_back(deck[card_index++]);
                 std::sort(hands[p].begin(), hands[p].end());
             }
-
-            if (!deal_ok) {
-                continue;
-            }
+            if (!deal_ok) continue;
             root_state.deal_hands(hands);
 
-            // Run CFR+ from the root for each player
+            // Run CFR+
             for (int player = 0; player < num_players; ++player) {
                 std::vector<double> initial_reach_probs(num_players, 1.0);
                 int current_card_idx = card_index;
@@ -507,20 +403,16 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
                 }
             }
 
-            // Increment completed iterations counter (atomic)
-            int current_completed = completed_iterations_++; // Post-increment
+            // Increment completed iterations counter
+            int current_completed = completed_iterations_++;
 
-            // --- Progress Logging (Thread 0 only, every 5%) ---
+            // Progress Logging (Thread 0 only)
             if (thread_id == 0) {
-                // Calculate percentage based on total iterations requested, not just iterations_to_run
                 int current_percent = static_cast<int>((static_cast<double>(current_completed + 1) / iterations) * 100.0);
                 int last_logged = last_logged_percent_.load();
-
                 if (current_percent >= last_logged + 5) {
-                    // Use compare_exchange_strong to ensure only one thread updates last_logged_percent_
-                    // for this percentage bracket, rounding down to the nearest 5.
                     int target_percent = current_percent - (current_percent % 5);
-                    if (target_percent > last_logged) { // Ensure we only log increasing percentages
+                    if (target_percent > last_logged) {
                          if (last_logged_percent_.compare_exchange_strong(last_logged, target_percent)) {
                               spdlog::info("Training progress: {}%", target_percent);
                          }
@@ -528,39 +420,27 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
                 }
             }
 
-             // --- Checkpointing (Thread 0 only, based on GLOBAL iterations) ---
+             // Checkpointing (Thread 0 only, based on GLOBAL iterations completed)
              if (thread_id == 0 && !save_filename.empty() && checkpoint_interval > 0) {
-                 // Check if the *global* completed count crosses an interval boundary
-                 // Need to track the last iteration number when a save occurred.
-                 // (Requires update in .h file as well)
-
-                 // Simplified check for now: Check if current_completed is a multiple of interval
-                 // This might save slightly off the exact interval due to thread scheduling, but is simpler.
-                 // A more robust way involves tracking the last saved iteration count.
-                 // Let's try the simple modulo check first.
-                 int completed_count = current_completed + 1; // Use the count *after* this iteration finishes
-                 if (completed_count % checkpoint_interval == 0 && completed_count > 0) {
-                      spdlog::info("[Thread 0] Reached checkpoint interval (around iteration {}). Saving state...", completed_count);
-                     // Use a temporary filename + atomic rename for safety
+                 int completed_count = current_completed + 1;
+                 if (completed_count / checkpoint_interval > last_checkpoint_iter_count) {
+                     last_checkpoint_iter_count = completed_count / checkpoint_interval;
+                     spdlog::info("[Thread 0] Reached checkpoint interval (around iteration {}). Saving state...", completed_count);
                      std::string temp_filename = save_filename + ".tmp";
                      if (save_checkpoint(temp_filename)) {
                          try {
-                             // Requires C++17 filesystem library
                              std::filesystem::rename(temp_filename, save_filename);
                              spdlog::info("[Thread 0] Checkpoint saved successfully to {}", save_filename);
                          } catch (const std::filesystem::filesystem_error& fs_err) {
                              spdlog::error("[Thread 0] Failed to rename temporary checkpoint file: {}", fs_err.what());
-                             // Attempt to remove temporary file if rename failed
                              try { std::filesystem::remove(temp_filename); } catch(...) {}
                          }
                      } else {
                          spdlog::error("[Thread 0] Failed to save checkpoint to temporary file {}", temp_filename);
                      }
-                     // Note: We don't reset last_checkpoint_iter here as it's not used in this logic
                  }
              }
-
-        } // End iteration loop for this thread
+        } // End iteration loop
     }; // End lambda worker_task
 
     // --- Launch Threads ---
@@ -583,7 +463,6 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
     }
 
     // --- Final Log & Save ---
-    // Ensure 100% is logged if the loop finished before the last 5% step triggered it
     if (last_logged_percent_.load() < 100 && completed_iterations_.load() >= iterations) {
          spdlog::info("Training progress: 100%");
     }
@@ -611,14 +490,49 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
 
 // Save state to JSON file
 bool CFREngine::save_checkpoint(const std::string& filename) const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(node_map_mutex_)); // Lock for reading map
+    // Lock the global map mutex first to prevent changes to the map structure during iteration
+    std::lock_guard<std::mutex> map_lock(const_cast<std::mutex&>(node_map_mutex_));
 
     json checkpoint_data;
     checkpoint_data["version"] = CHECKPOINT_VERSION_JSON;
     checkpoint_data["completed_iterations"] = completed_iterations_.load();
     checkpoint_data["total_nodes_created"] = total_nodes_created_.load();
-    checkpoint_data["node_map"] = node_map_; // nlohmann/json handles map<string, Node> via to_json
 
+    json node_map_json = json::object(); // Create a JSON object for the map
+
+    for (const auto& pair : node_map_) {
+        const std::string& key = pair.first;
+        const std::unique_ptr<Node>& node_ptr = pair.second; // Get the unique_ptr
+
+        if (!node_ptr) continue; // Safety check
+
+        // Lock the individual node's mutex before accessing its data
+        std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
+
+        // Check for invalid numbers before serialization
+        bool invalid_data = false;
+        for(double val : node_ptr->regret_sum) { if(std::isnan(val) || std::isinf(val)) invalid_data = true; }
+        for(double val : node_ptr->strategy_sum) { if(std::isnan(val) || std::isinf(val)) invalid_data = true; }
+
+        if(invalid_data) {
+            spdlog::error("Invalid (NaN/Inf) data found in node '{}'. Skipping save for this node.", key);
+            continue; // Skip this node
+        }
+
+        // Create JSON object for the node (locking handled above)
+        node_map_json[key] = {
+            {"num_actions", node_ptr->regret_sum.size()}, // Store num_actions explicitly
+            {"regret_sum", node_ptr->regret_sum},
+            {"strategy_sum", node_ptr->strategy_sum},
+            {"visit_count", node_ptr->visit_count.load()} // Load atomic value
+        };
+    } // Node mutex released here
+
+    checkpoint_data["node_map"] = node_map_json;
+
+    // Map mutex is released when map_lock goes out of scope
+
+    // Now write the JSON data to the file
     std::ofstream ofs(filename);
     if (!ofs) {
         spdlog::error("Failed to open checkpoint file for writing: {}", filename);
@@ -643,7 +557,6 @@ bool CFREngine::save_checkpoint(const std::string& filename) const {
 
 // Load state from JSON file
 int CFREngine::load_checkpoint(const std::string& filename) {
-    std::lock_guard<std::mutex> lock(node_map_mutex_); // Lock for writing map
 
     std::ifstream ifs(filename);
     if (!ifs) {
@@ -654,6 +567,7 @@ int CFREngine::load_checkpoint(const std::string& filename) {
     json checkpoint_data;
     int loaded_iterations = -1;
     long long loaded_nodes_created = 0;
+    NodeMap temp_node_map; // Load into a temporary map first
 
     try {
         ifs >> checkpoint_data; // Parse the entire JSON file
@@ -691,8 +605,7 @@ int CFREngine::load_checkpoint(const std::string& filename) {
              return -1;
         }
 
-        // --- Manually deserialize the node_map ---
-        node_map_.clear(); // Clear existing map
+        // --- Manually deserialize the node_map into temp_node_map ---
         const json& node_map_json = checkpoint_data.at("node_map");
         if (!node_map_json.is_object()) {
              spdlog::error("'node_map' in checkpoint is not a JSON object.");
@@ -703,24 +616,31 @@ int CFREngine::load_checkpoint(const std::string& filename) {
             const std::string& key = it.key();
             const json& node_json = it.value();
             try {
-                // Create a default Node first (needs number of actions, which we don't have here!)
-                // --> Problem: We need the number of actions to construct a Node before calling from_json.
-                // --> Let's store num_actions within the Node JSON itself during save.
-
-                // --- TEMPORARY WORKAROUND (Assumes fixed number of actions, needs fix) ---
-                // This is incorrect if different nodes have different action counts!
-                // We need to store num_actions in the JSON.
-                // For now, let's assume a default or get it from the first loaded node if possible.
-                // This part needs refinement. Let's assume 6 actions for now as a placeholder.
-                size_t num_actions_placeholder = 6; // FIXME: This is wrong!
-                if (node_json.contains("regret_sum")) { // Get size from loaded data if possible
-                    num_actions_placeholder = node_json["regret_sum"].size();
+                // Read num_actions first
+                if (!node_json.contains("num_actions")) {
+                     spdlog::error("Missing 'num_actions' for node key '{}'", key);
+                     return -1;
                 }
-                Node node(num_actions_placeholder); // Create node with placeholder size
-                from_json(node_json, node); // Call our from_json function explicitly
+                size_t num_actions = node_json.at("num_actions").get<size_t>();
 
-                // Use try_emplace which works with move-only types
-                node_map_.try_emplace(key, std::move(node));
+                // Create the node using make_unique
+                auto node_ptr = std::make_unique<Node>(num_actions);
+
+                // Populate the constructed node using a helper function (or direct access)
+                // No lock needed on node_ptr->node_mutex as it's local
+                node_json.at("regret_sum").get_to(node_ptr->regret_sum);
+                node_json.at("strategy_sum").get_to(node_ptr->strategy_sum);
+                if (node_ptr->regret_sum.size() != num_actions || node_ptr->strategy_sum.size() != num_actions) {
+                     throw std::runtime_error("Mismatch in vector sizes during JSON deserialization");
+                }
+                int visits = 0;
+                node_json.at("visit_count").get_to(visits);
+                node_ptr->visit_count.store(visits);
+
+
+                // Use try_emplace with std::move into the temporary map
+                temp_node_map.try_emplace(key, std::move(node_ptr));
+
             } catch (const json::exception& e) {
                  spdlog::error("Failed to deserialize node for key '{}': {}", key, e.what());
                  return -1; // Stop loading on error
@@ -728,26 +648,19 @@ int CFREngine::load_checkpoint(const std::string& filename) {
         }
         // --- End manual deserialization ---
 
-
         // Update node count if it wasn't loaded or seems inconsistent
-        if (loaded_nodes_created == 0 || loaded_nodes_created != (long long)node_map_.size()) {
-             if (loaded_nodes_created != 0) { // Log warning only if value was present but different
-                 spdlog::warn("Loaded 'total_nodes_created' ({}) differs from loaded map size ({}). Using map size.", loaded_nodes_created, node_map_.size());
+        if (loaded_nodes_created == 0 || loaded_nodes_created != (long long)temp_node_map.size()) {
+             if (loaded_nodes_created != 0) {
+                 spdlog::warn("Loaded 'total_nodes_created' ({}) differs from loaded map size ({}). Using map size.", loaded_nodes_created, temp_node_map.size());
              }
-             loaded_nodes_created = node_map_.size();
+             loaded_nodes_created = temp_node_map.size();
         }
-
-        // Update atomic counters after successful load
-        completed_iterations_.store(loaded_iterations);
-        total_nodes_created_.store(loaded_nodes_created);
-
-        return loaded_iterations; // Return number of iterations loaded
 
     } catch (const json::parse_error& e) {
         spdlog::error("JSON parse error during load: {}", e.what());
         if(ifs.is_open()) ifs.close();
         return -1;
-    } catch (const json::exception& e) { // Catch other json exceptions (type errors, missing keys from .at())
+    } catch (const json::exception& e) { // Catch other json exceptions
          spdlog::error("JSON exception during load: {}", e.what());
          if(ifs.is_open()) ifs.close();
          return -1;
@@ -756,21 +669,39 @@ int CFREngine::load_checkpoint(const std::string& filename) {
          if(ifs.is_open()) ifs.close();
          return -1;
     }
-}
+
+    // --- Safely swap the loaded map with the member map ---
+    {
+        std::lock_guard<std::mutex> lock(node_map_mutex_);
+        node_map_ = std::move(temp_node_map); // Move the loaded map into the member variable
+    }
+
+    // Update atomic counters after successful load and swap
+    completed_iterations_.store(loaded_iterations);
+    total_nodes_created_.store(loaded_nodes_created);
+
+    return loaded_iterations; // Return number of iterations loaded
+
+} // <--- Closing brace for load_checkpoint function
 
 
 std::vector<double> CFREngine::get_strategy(const std::string& info_set_key) {
-    // Reading the strategy also needs protection if writes can happen concurrently
-    // Although training is finished, another thread *could* theoretically call this.
-    // For simplicity, lock reads too. Could use std::shared_mutex for read-write locks later.
-    std::lock_guard<std::mutex> lock(node_map_mutex_);
+    // Lock the global map mutex first to find the node
+    std::lock_guard<std::mutex> map_lock(node_map_mutex_);
     auto it = node_map_.find(info_set_key);
     if (it != node_map_.end()) {
-        // Return average strategy
-        return it->second.get_average_strategy();
+        // Node found, now lock the node's specific mutex before accessing its data
+        // Use .get() to get the raw pointer from unique_ptr
+        Node* node_ptr = it->second.get();
+        if (node_ptr) { // Check if pointer is valid
+             std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
+             // Return average strategy (calculated while node is locked)
+             return node_ptr->get_average_strategy();
+        } else {
+             spdlog::error("Null pointer found in NodeMap for key: {}", info_set_key);
+             return {};
+        }
     } else {
-        // Don't log warning here, as it's expected for unvisited nodes during extraction
-        // spdlog::warn("InfoSet key not found: {}", info_set_key);
         return {}; // Return empty vector if node doesn't exist
     }
 }
