@@ -33,30 +33,9 @@ using json = nlohmann::json;
 // Define a simple version number for the checkpoint format
 const std::string CHECKPOINT_VERSION_JSON = "1.1-json";
 
-namespace { // Anonymous namespace for helpers local to this file
-
-// Helper function to deserialize JSON data into an existing Node object
-// Assumes node is already constructed with the correct size based on num_actions read from JSON
-void from_json_node_helper(const json& j, gto_solver::Node& node) {
-    // No locking needed here as we operate on a temporary Node object before inserting into the map
-    j.at("regret_sum").get_to(node.regret_sum);
-    j.at("strategy_sum").get_to(node.strategy_sum);
-    // Optional: Verify sizes match the pre-constructed node's size
-    if (node.regret_sum.size() != node.strategy_sum.size() || node.regret_sum.size() != j.at("num_actions").get<size_t>()) {
-         throw std::runtime_error("Mismatch in vector sizes during JSON deserialization");
-     }
-    int visits = 0;
-    j.at("visit_count").get_to(visits);
-    node.visit_count.store(visits);
-}
-
-} // anonymous namespace
-
-
 namespace gto_solver {
 
 // --- Helper Function: Regret Matching ---
-// (remains the same)
 std::vector<double> get_strategy_from_regrets(const std::vector<double>& regrets) {
     size_t num_actions = regrets.size();
     std::vector<double> strategy(num_actions);
@@ -97,8 +76,9 @@ double CFREngine::cfr_plus_recursive(
     int& card_idx
 ) {
     // (Terminal state logic remains the same)
-    Street entry_street = current_state.get_current_street();
+     Street entry_street = current_state.get_current_street();
     if (current_state.is_terminal()) {
+        // ... (payoff calculation logic is unchanged) ...
         double final_payoff = 0.0;
         int num_players = current_state.get_num_players();
         std::vector<double> contributions(num_players);
@@ -208,7 +188,7 @@ double CFREngine::cfr_plus_recursive(
     std::vector<double> current_regrets;
     {
         std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex); // Lock specific node
-        current_regrets = node_ptr->regret_sum;
+        current_regrets = node_ptr->regret_sum; // Copy regrets under node lock
     }
     std::vector<double> current_strategy = get_strategy_from_regrets(current_regrets);
 
@@ -290,7 +270,7 @@ double CFREngine::cfr_plus_recursive(
                  for (size_t i = 0; i < num_actions; ++i) {
                      double regret = action_utilities[i] - node_utility;
                      if (!std::isnan(regret) && !std::isinf(regret)) {
-                        node_ptr->regret_sum[i] += counterfactual_reach_prob * regret;
+                        node_ptr->regret_sum[i] += counterfactual_reach_prob * regret; // Use simple +=
                      } else {
                         spdlog::warn("Invalid regret calculated for action {} in node {}: {}", i, info_set_key, regret);
                      }
@@ -300,7 +280,7 @@ double CFREngine::cfr_plus_recursive(
              if (player_reach_prob > 1e-9) {
                  for (size_t i = 0; i < num_actions; ++i) {
                      if (!std::isnan(current_strategy[i]) && !std::isinf(current_strategy[i])) {
-                        node_ptr->strategy_sum[i] += player_reach_prob * current_strategy[i];
+                        node_ptr->strategy_sum[i] += player_reach_prob * current_strategy[i]; // Use simple +=
                      } else {
                          spdlog::warn("Invalid strategy value calculated for action {} in node {}: {}", i, info_set_key, current_strategy[i]);
                      }
@@ -319,7 +299,7 @@ double CFREngine::cfr_plus_recursive(
 
 // Updated signature to accept game parameters and number of threads
 void CFREngine::train(int iterations, int num_players, int initial_stack, int ante_size, int num_threads, const std::string& save_filename, int checkpoint_interval, const std::string& load_filename) {
-    // --- Load Checkpoint if specified ---
+    // (Load checkpoint logic remains the same)
     int starting_iteration = 0;
     if (!load_filename.empty()) {
         spdlog::info("Attempting to load checkpoint from: {}", load_filename);
@@ -331,27 +311,19 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
             spdlog::warn("Failed to load checkpoint from {}. Starting training from scratch.", load_filename);
         }
     }
-
     int iterations_to_run = iterations - starting_iteration;
     if (iterations_to_run <= 0) {
         spdlog::info("Target iterations ({}) already reached or exceeded by checkpoint ({}). No training needed.", iterations, starting_iteration);
         return;
     }
      spdlog::info("Need to run {} more iterations.", iterations_to_run);
-
-
-    // --- Reset Counters (relative to loaded state) ---
     completed_iterations_ = starting_iteration;
     if (starting_iteration == 0) total_nodes_created_ = 0;
     last_logged_percent_ = -1;
-
-    // --- Determine Number of Threads ---
     unsigned int hardware_threads = std::thread::hardware_concurrency();
     unsigned int threads_to_use = (num_threads <= 0) ? hardware_threads : std::min((unsigned int)num_threads, hardware_threads);
     if (threads_to_use == 0) threads_to_use = 1;
     spdlog::info("Using {} threads for training.", threads_to_use);
-
-    // --- Deck Initialization (Master Deck) ---
     std::vector<Card> master_deck;
     const std::vector<char> ranks = {'2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'};
     const std::vector<char> suits = {'c', 'd', 'h', 's'};
@@ -361,22 +333,19 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
         }
     }
 
-    // --- Thread Worker Function ---
+    // --- Thread Worker Function (remains largely the same, calls updated cfr_plus_recursive) ---
     auto worker_task = [&](int thread_id, int iterations_for_thread) {
         unsigned seed = std::chrono::system_clock::now().time_since_epoch().count()
                       + thread_id + starting_iteration;
         std::mt19937 rng(seed);
         std::vector<Card> deck = master_deck;
-        int last_checkpoint_iter_count = starting_iteration / checkpoint_interval; // Initialize based on starting iter
+        int last_checkpoint_iter_count = (checkpoint_interval > 0) ? starting_iteration / checkpoint_interval : 0; // Avoid division by zero
 
         for (int i = 0; i < iterations_for_thread; ++i) {
             int global_iteration_approx = starting_iteration + completed_iterations_.load();
             int button_pos = global_iteration_approx % num_players;
-
             GameState root_state(num_players, initial_stack, ante_size, button_pos);
             std::shuffle(deck.begin(), deck.end(), rng);
-
-            // Deal hands
             std::vector<std::vector<Card>> hands(num_players);
             int card_index = 0;
             bool deal_ok = true;
@@ -391,8 +360,6 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
             }
             if (!deal_ok) continue;
             root_state.deal_hands(hands);
-
-            // Run CFR+
             for (int player = 0; player < num_players; ++player) {
                 std::vector<double> initial_reach_probs(num_players, 1.0);
                 int current_card_idx = card_index;
@@ -402,11 +369,7 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
                      spdlog::error("[Thread {}] Exception in cfr_plus_recursive: {}", thread_id, e.what());
                 }
             }
-
-            // Increment completed iterations counter
             int current_completed = completed_iterations_++;
-
-            // Progress Logging (Thread 0 only)
             if (thread_id == 0) {
                 int current_percent = static_cast<int>((static_cast<double>(current_completed + 1) / iterations) * 100.0);
                 int last_logged = last_logged_percent_.load();
@@ -419,8 +382,6 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
                     }
                 }
             }
-
-             // Checkpointing (Thread 0 only, based on GLOBAL iterations completed)
              if (thread_id == 0 && !save_filename.empty() && checkpoint_interval > 0) {
                  int completed_count = current_completed + 1;
                  if (completed_count / checkpoint_interval > last_checkpoint_iter_count) {
@@ -443,32 +404,23 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
         } // End iteration loop
     }; // End lambda worker_task
 
-    // --- Launch Threads ---
+    // (Thread launch and join logic remains the same)
     std::vector<std::thread> threads;
     int iterations_per_thread = iterations_to_run / threads_to_use;
     int remaining_iterations = iterations_to_run % threads_to_use;
-
     for (unsigned int i = 0; i < threads_to_use; ++i) {
         int iters = iterations_per_thread + (i < remaining_iterations ? 1 : 0);
-        if (iters > 0) {
-            threads.emplace_back(worker_task, i, iters);
-        }
+        if (iters > 0) threads.emplace_back(worker_task, i, iters);
     }
-
-    // --- Join Threads ---
     for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
-        }
+        if (t.joinable()) t.join();
     }
 
-    // --- Final Log & Save ---
+    // (Final log and save logic remains the same)
     if (last_logged_percent_.load() < 100 && completed_iterations_.load() >= iterations) {
          spdlog::info("Training progress: 100%");
     }
     spdlog::info("Training complete. Total iterations run: {}. Final iteration count: {}. Nodes created: {}", iterations_to_run, completed_iterations_.load(), total_nodes_created_.load());
-
-    // Final save if requested
     if (!save_filename.empty()) {
         spdlog::info("Performing final save to checkpoint file: {}", save_filename);
         std::string temp_filename = save_filename + ".final.tmp";
@@ -488,9 +440,8 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
 
 // --- Checkpointing Methods ---
 
-// Save state to JSON file
+// Save state to JSON file (adapted for unique_ptr and mutex-per-node)
 bool CFREngine::save_checkpoint(const std::string& filename) const {
-    // Lock the global map mutex first to prevent changes to the map structure during iteration
     std::lock_guard<std::mutex> map_lock(const_cast<std::mutex&>(node_map_mutex_));
 
     json checkpoint_data;
@@ -498,41 +449,39 @@ bool CFREngine::save_checkpoint(const std::string& filename) const {
     checkpoint_data["completed_iterations"] = completed_iterations_.load();
     checkpoint_data["total_nodes_created"] = total_nodes_created_.load();
 
-    json node_map_json = json::object(); // Create a JSON object for the map
+    json node_map_json = json::object();
 
     for (const auto& pair : node_map_) {
         const std::string& key = pair.first;
-        const std::unique_ptr<Node>& node_ptr = pair.second; // Get the unique_ptr
+        const std::unique_ptr<Node>& node_ptr = pair.second;
 
-        if (!node_ptr) continue; // Safety check
+        if (!node_ptr) continue;
 
         // Lock the individual node's mutex before accessing its data
         std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
 
         // Check for invalid numbers before serialization
         bool invalid_data = false;
+        // Access data directly from node_ptr now
         for(double val : node_ptr->regret_sum) { if(std::isnan(val) || std::isinf(val)) invalid_data = true; }
         for(double val : node_ptr->strategy_sum) { if(std::isnan(val) || std::isinf(val)) invalid_data = true; }
 
         if(invalid_data) {
             spdlog::error("Invalid (NaN/Inf) data found in node '{}'. Skipping save for this node.", key);
-            continue; // Skip this node
+            continue;
         }
 
-        // Create JSON object for the node (locking handled above)
+        // Create JSON object for the node
         node_map_json[key] = {
-            {"num_actions", node_ptr->regret_sum.size()}, // Store num_actions explicitly
+            {"num_actions", node_ptr->regret_sum.size()},
             {"regret_sum", node_ptr->regret_sum},
             {"strategy_sum", node_ptr->strategy_sum},
-            {"visit_count", node_ptr->visit_count.load()} // Load atomic value
+            {"visit_count", node_ptr->visit_count.load()}
         };
     } // Node mutex released here
 
     checkpoint_data["node_map"] = node_map_json;
 
-    // Map mutex is released when map_lock goes out of scope
-
-    // Now write the JSON data to the file
     std::ofstream ofs(filename);
     if (!ofs) {
         spdlog::error("Failed to open checkpoint file for writing: {}", filename);
@@ -540,22 +489,19 @@ bool CFREngine::save_checkpoint(const std::string& filename) const {
     }
 
     try {
-        // Use dump() without indentation for potentially lower memory usage during serialization
-        ofs << checkpoint_data.dump();
+        ofs << checkpoint_data.dump(); // Use compact dump
         ofs.close();
         return ofs.good();
     } catch (const json::exception& e) {
         spdlog::error("JSON serialization error during save: {}", e.what());
-        ofs.close();
-        return false;
+        ofs.close(); return false;
     } catch (const std::exception& e) {
         spdlog::error("Standard exception during save: {}", e.what());
-        ofs.close();
-        return false;
+        ofs.close(); return false;
     }
 }
 
-// Load state from JSON file
+// Load state from JSON file (adapted for unique_ptr and mutex-per-node)
 int CFREngine::load_checkpoint(const std::string& filename) {
 
     std::ifstream ifs(filename);
@@ -570,7 +516,7 @@ int CFREngine::load_checkpoint(const std::string& filename) {
     NodeMap temp_node_map; // Load into a temporary map first
 
     try {
-        ifs >> checkpoint_data; // Parse the entire JSON file
+        ifs >> checkpoint_data;
         ifs.close();
 
         // Version Check
@@ -581,13 +527,11 @@ int CFREngine::load_checkpoint(const std::string& filename) {
 
         // Completed Iterations
         if (!checkpoint_data.contains("completed_iterations")) {
-             spdlog::error("Missing 'completed_iterations' in checkpoint.");
-             return -1;
+             spdlog::error("Missing 'completed_iterations' in checkpoint."); return -1;
         }
         loaded_iterations = checkpoint_data["completed_iterations"].get<int>();
         if (loaded_iterations < 0) {
-             spdlog::error("Invalid 'completed_iterations' value in checkpoint.");
-             return -1;
+             spdlog::error("Invalid 'completed_iterations' value in checkpoint."); return -1;
         }
 
         // Total Nodes Created (Optional)
@@ -595,39 +539,33 @@ int CFREngine::load_checkpoint(const std::string& filename) {
             loaded_nodes_created = checkpoint_data["total_nodes_created"].get<long long>();
         } else {
              spdlog::warn("Missing 'total_nodes_created' in checkpoint. Will estimate.");
-             loaded_nodes_created = 0; // Will be updated below
+             loaded_nodes_created = 0;
         }
-
 
         // Node Map Data
         if (!checkpoint_data.contains("node_map")) {
-             spdlog::error("Missing 'node_map' in checkpoint.");
-             return -1;
+             spdlog::error("Missing 'node_map' in checkpoint."); return -1;
         }
 
         // --- Manually deserialize the node_map into temp_node_map ---
         const json& node_map_json = checkpoint_data.at("node_map");
         if (!node_map_json.is_object()) {
-             spdlog::error("'node_map' in checkpoint is not a JSON object.");
-             return -1;
+             spdlog::error("'node_map' in checkpoint is not a JSON object."); return -1;
         }
 
         for (auto it = node_map_json.begin(); it != node_map_json.end(); ++it) {
             const std::string& key = it.key();
             const json& node_json = it.value();
             try {
-                // Read num_actions first
                 if (!node_json.contains("num_actions")) {
-                     spdlog::error("Missing 'num_actions' for node key '{}'", key);
-                     return -1;
+                     spdlog::error("Missing 'num_actions' for node key '{}'", key); return -1;
                 }
                 size_t num_actions = node_json.at("num_actions").get<size_t>();
 
                 // Create the node using make_unique
                 auto node_ptr = std::make_unique<Node>(num_actions);
 
-                // Populate the constructed node using a helper function (or direct access)
-                // No lock needed on node_ptr->node_mutex as it's local
+                // Populate the constructed node (no lock needed on local node_ptr)
                 node_json.at("regret_sum").get_to(node_ptr->regret_sum);
                 node_json.at("strategy_sum").get_to(node_ptr->strategy_sum);
                 if (node_ptr->regret_sum.size() != num_actions || node_ptr->strategy_sum.size() != num_actions) {
@@ -635,20 +573,18 @@ int CFREngine::load_checkpoint(const std::string& filename) {
                 }
                 int visits = 0;
                 node_json.at("visit_count").get_to(visits);
-                node_ptr->visit_count.store(visits);
-
+                node_ptr->visit_count.store(visits, std::memory_order_relaxed);
 
                 // Use try_emplace with std::move into the temporary map
                 temp_node_map.try_emplace(key, std::move(node_ptr));
 
             } catch (const json::exception& e) {
                  spdlog::error("Failed to deserialize node for key '{}': {}", key, e.what());
-                 return -1; // Stop loading on error
+                 return -1;
             }
         }
         // --- End manual deserialization ---
 
-        // Update node count if it wasn't loaded or seems inconsistent
         if (loaded_nodes_created == 0 || loaded_nodes_created != (long long)temp_node_map.size()) {
              if (loaded_nodes_created != 0) {
                  spdlog::warn("Loaded 'total_nodes_created' ({}) differs from loaded map size ({}). Using map size.", loaded_nodes_created, temp_node_map.size());
@@ -658,29 +594,26 @@ int CFREngine::load_checkpoint(const std::string& filename) {
 
     } catch (const json::parse_error& e) {
         spdlog::error("JSON parse error during load: {}", e.what());
-        if(ifs.is_open()) ifs.close();
-        return -1;
-    } catch (const json::exception& e) { // Catch other json exceptions
+        if(ifs.is_open()) ifs.close(); return -1;
+    } catch (const json::exception& e) {
          spdlog::error("JSON exception during load: {}", e.what());
-         if(ifs.is_open()) ifs.close();
-         return -1;
+         if(ifs.is_open()) ifs.close(); return -1;
     } catch (const std::exception& e) {
          spdlog::error("Standard exception during load: {}", e.what());
-         if(ifs.is_open()) ifs.close();
-         return -1;
+         if(ifs.is_open()) ifs.close(); return -1;
     }
 
     // --- Safely swap the loaded map with the member map ---
     {
         std::lock_guard<std::mutex> lock(node_map_mutex_);
-        node_map_ = std::move(temp_node_map); // Move the loaded map into the member variable
+        node_map_ = std::move(temp_node_map);
     }
 
     // Update atomic counters after successful load and swap
     completed_iterations_.store(loaded_iterations);
     total_nodes_created_.store(loaded_nodes_created);
 
-    return loaded_iterations; // Return number of iterations loaded
+    return loaded_iterations;
 
 } // <--- Closing brace for load_checkpoint function
 
@@ -690,10 +623,10 @@ std::vector<double> CFREngine::get_strategy(const std::string& info_set_key) {
     std::lock_guard<std::mutex> map_lock(node_map_mutex_);
     auto it = node_map_.find(info_set_key);
     if (it != node_map_.end()) {
-        // Node found, now lock the node's specific mutex before accessing its data
-        // Use .get() to get the raw pointer from unique_ptr
+        // Node found, use .get() to get the raw pointer from unique_ptr
         Node* node_ptr = it->second.get();
-        if (node_ptr) { // Check if pointer is valid
+        if (node_ptr) {
+             // Lock the node's specific mutex before accessing its data
              std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
              // Return average strategy (calculated while node is locked)
              return node_ptr->get_average_strategy();
@@ -702,7 +635,7 @@ std::vector<double> CFREngine::get_strategy(const std::string& info_set_key) {
              return {};
         }
     } else {
-        return {}; // Return empty vector if node doesn't exist
+        return {};
     }
 }
 

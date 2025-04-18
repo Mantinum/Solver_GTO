@@ -7,12 +7,8 @@
 #include <string>
 #include <memory> // For std::unique_ptr
 #include <atomic>
-#include <mutex>
+#include <mutex>  // Include mutex
 
-// Forward declare json class to avoid including the full header here (optional, but good practice)
-// #include <nlohmann/json_fwd.hpp>
-// using json = nlohmann::json;
-// --> Actually, keep the full include for simplicity for now, as from_json/to_json might be useful later
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 
@@ -20,7 +16,6 @@ using json = nlohmann::json;
 namespace gto_solver {
 
 // Represents a node in the game tree or the storage for CFR data per InfoSet.
-// This structure will hold the regrets and the average strategy.
 struct Node {
     // Regrets for not taking action 'a' at this infoset. Size = number of possible actions.
     std::vector<double> regret_sum;
