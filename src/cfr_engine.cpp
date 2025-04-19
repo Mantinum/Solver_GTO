@@ -24,18 +24,16 @@
 #include <cmath>     // For std::isnan, std::isinf
 #include <memory>    // For std::unique_ptr, std::make_unique
 
-#include <nlohmann/json.hpp> // Include JSON library
+// #include <nlohmann/json.hpp> // No longer needed for binary format
 #include "spdlog/spdlog.h" // Include spdlog
 
-// Alias for convenience
-using json = nlohmann::json;
-
-// Define a simple version number for the checkpoint format
-const std::string CHECKPOINT_VERSION_JSON = "1.1-json";
+// Define a simple version number for the BINARY checkpoint format
+const uint32_t CHECKPOINT_VERSION_BIN = 2; // Increment version for binary format
 
 namespace gto_solver {
 
 // --- Helper Function: Regret Matching ---
+// (remains the same)
 std::vector<double> get_strategy_from_regrets(const std::vector<double>& regrets) {
     size_t num_actions = regrets.size();
     std::vector<double> strategy(num_actions);
@@ -299,7 +297,7 @@ double CFREngine::cfr_plus_recursive(
 
 // Updated signature to accept game parameters and number of threads
 void CFREngine::train(int iterations, int num_players, int initial_stack, int ante_size, int num_threads, const std::string& save_filename, int checkpoint_interval, const std::string& load_filename) {
-    // (Load checkpoint logic remains the same)
+    // --- Load Checkpoint if specified ---
     int starting_iteration = 0;
     if (!load_filename.empty()) {
         spdlog::info("Attempting to load checkpoint from: {}", load_filename);
@@ -440,164 +438,186 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
 
 // --- Checkpointing Methods ---
 
-// Save state to JSON file (adapted for unique_ptr and mutex-per-node)
+// Save state to BINARY file (adapted for unique_ptr and mutex-per-node)
 bool CFREngine::save_checkpoint(const std::string& filename) const {
     std::lock_guard<std::mutex> map_lock(const_cast<std::mutex&>(node_map_mutex_));
 
-    json checkpoint_data;
-    checkpoint_data["version"] = CHECKPOINT_VERSION_JSON;
-    checkpoint_data["completed_iterations"] = completed_iterations_.load();
-    checkpoint_data["total_nodes_created"] = total_nodes_created_.load();
-
-    json node_map_json = json::object();
-
-    for (const auto& pair : node_map_) {
-        const std::string& key = pair.first;
-        const std::unique_ptr<Node>& node_ptr = pair.second;
-
-        if (!node_ptr) continue;
-
-        // Lock the individual node's mutex before accessing its data
-        std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
-
-        // Check for invalid numbers before serialization
-        bool invalid_data = false;
-        // Access data directly from node_ptr now
-        for(double val : node_ptr->regret_sum) { if(std::isnan(val) || std::isinf(val)) invalid_data = true; }
-        for(double val : node_ptr->strategy_sum) { if(std::isnan(val) || std::isinf(val)) invalid_data = true; }
-
-        if(invalid_data) {
-            spdlog::error("Invalid (NaN/Inf) data found in node '{}'. Skipping save for this node.", key);
-            continue;
-        }
-
-        // Create JSON object for the node
-        node_map_json[key] = {
-            {"num_actions", node_ptr->regret_sum.size()},
-            {"regret_sum", node_ptr->regret_sum},
-            {"strategy_sum", node_ptr->strategy_sum},
-            {"visit_count", node_ptr->visit_count.load()}
-        };
-    } // Node mutex released here
-
-    checkpoint_data["node_map"] = node_map_json;
-
-    std::ofstream ofs(filename);
+    std::ofstream ofs(filename, std::ios::binary | std::ios::trunc);
     if (!ofs) {
         spdlog::error("Failed to open checkpoint file for writing: {}", filename);
         return false;
     }
 
     try {
-        ofs << checkpoint_data.dump(); // Use compact dump
-        ofs.close();
-        return ofs.good();
-    } catch (const json::exception& e) {
-        spdlog::error("JSON serialization error during save: {}", e.what());
-        ofs.close(); return false;
+        // 1. Version
+        uint32_t version = CHECKPOINT_VERSION_BIN; // Use binary version
+        ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        if (!ofs) { spdlog::error("Error writing version"); return false; }
+
+
+        // 2. Completed Iterations
+        int completed = completed_iterations_.load();
+        ofs.write(reinterpret_cast<const char*>(&completed), sizeof(completed));
+         if (!ofs) { spdlog::error("Error writing completed iterations"); return false; }
+
+
+        // 3. Node Map Size
+        size_t map_size = node_map_.size();
+        ofs.write(reinterpret_cast<const char*>(&map_size), sizeof(map_size));
+         if (!ofs) { spdlog::error("Error writing map size"); return false; }
+
+
+        // 4. Node Map Data
+        for (const auto& pair : node_map_) {
+            const std::string& key = pair.first;
+            const std::unique_ptr<Node>& node_ptr = pair.second;
+
+            if (!node_ptr) {
+                 spdlog::warn("Null pointer found in map for key '{}'. Skipping save.", key);
+                 continue;
+            }
+
+            // Lock the individual node's mutex before accessing its data
+            std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
+
+            // Write key length and key
+            size_t key_len = key.length();
+            ofs.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+             if (!ofs) { spdlog::error("Error writing key length for key '{}'", key); return false; }
+            ofs.write(key.c_str(), key_len);
+             if (!ofs) { spdlog::error("Error writing key data for key '{}'", key); return false; }
+
+
+            // Write vector sizes (assuming they are the same)
+            size_t vec_size = node_ptr->regret_sum.size();
+            if (vec_size != node_ptr->strategy_sum.size()) {
+                 spdlog::error("Mismatch in vector sizes for node key '{}'. Cannot save checkpoint.", key);
+                 return false;
+            }
+            ofs.write(reinterpret_cast<const char*>(&vec_size), sizeof(vec_size));
+             if (!ofs) { spdlog::error("Error writing vector size for key '{}'", key); return false; }
+
+
+            // Write regret_sum data
+            ofs.write(reinterpret_cast<const char*>(node_ptr->regret_sum.data()), vec_size * sizeof(double));
+             if (!ofs) { spdlog::error("Error writing regret_sum for key '{}'", key); return false; }
+
+
+            // Write strategy_sum data
+            ofs.write(reinterpret_cast<const char*>(node_ptr->strategy_sum.data()), vec_size * sizeof(double));
+             if (!ofs) { spdlog::error("Error writing strategy_sum for key '{}'", key); return false; }
+
+
+            // Write visit_count (load from atomic)
+            int visits = node_ptr->visit_count.load();
+            ofs.write(reinterpret_cast<const char*>(&visits), sizeof(visits));
+             if (!ofs) { spdlog::error("Error writing visit_count for key '{}'", key); return false; }
+
+        } // Node mutex released here
+
+        // 5. Total Nodes Created (Optional but useful for consistency check)
+        long long nodes_created = total_nodes_created_.load();
+        ofs.write(reinterpret_cast<const char*>(&nodes_created), sizeof(nodes_created));
+         if (!ofs) { spdlog::error("Error writing total nodes created"); return false; }
+
+
     } catch (const std::exception& e) {
-        spdlog::error("Standard exception during save: {}", e.what());
-        ofs.close(); return false;
+         spdlog::error("Exception caught during checkpoint save: {}", e.what());
+         ofs.close(); // Ensure file is closed on exception
+         return false;
     }
+
+    ofs.close();
+    return ofs.good();
 }
 
-// Load state from JSON file (adapted for unique_ptr and mutex-per-node)
+
+// Load state from BINARY file (adapted for unique_ptr and mutex-per-node)
 int CFREngine::load_checkpoint(const std::string& filename) {
 
-    std::ifstream ifs(filename);
+    std::ifstream ifs(filename, std::ios::binary);
     if (!ifs) {
         spdlog::error("Failed to open checkpoint file for reading: {}", filename);
         return -1;
     }
 
-    json checkpoint_data;
     int loaded_iterations = -1;
     long long loaded_nodes_created = 0;
     NodeMap temp_node_map; // Load into a temporary map first
 
     try {
-        ifs >> checkpoint_data;
-        ifs.close();
-
-        // Version Check
-        if (!checkpoint_data.contains("version") || checkpoint_data["version"] != CHECKPOINT_VERSION_JSON) {
-            spdlog::error("Checkpoint file version mismatch or missing version. Expected: {}", CHECKPOINT_VERSION_JSON);
-            return -1;
+        // 1. Version Check
+        uint32_t version;
+        ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (!ifs || version != CHECKPOINT_VERSION_BIN) {
+            spdlog::error("Checkpoint file version mismatch or read error. Expected: {}, Found: {}", CHECKPOINT_VERSION_BIN, version);
+            ifs.close(); return -1;
         }
 
-        // Completed Iterations
-        if (!checkpoint_data.contains("completed_iterations")) {
-             spdlog::error("Missing 'completed_iterations' in checkpoint."); return -1;
-        }
-        loaded_iterations = checkpoint_data["completed_iterations"].get<int>();
-        if (loaded_iterations < 0) {
-             spdlog::error("Invalid 'completed_iterations' value in checkpoint."); return -1;
+        // 2. Completed Iterations
+        ifs.read(reinterpret_cast<char*>(&loaded_iterations), sizeof(loaded_iterations));
+        if (!ifs || loaded_iterations < 0) {
+             spdlog::error("Invalid or missing iteration count in checkpoint.");
+             ifs.close(); return -1;
         }
 
-        // Total Nodes Created (Optional)
-        if (checkpoint_data.contains("total_nodes_created")) {
-            loaded_nodes_created = checkpoint_data["total_nodes_created"].get<long long>();
-        } else {
-             spdlog::warn("Missing 'total_nodes_created' in checkpoint. Will estimate.");
-             loaded_nodes_created = 0;
+        // 3. Node Map Size
+        size_t map_size;
+        ifs.read(reinterpret_cast<char*>(&map_size), sizeof(map_size));
+         if (!ifs) {
+             spdlog::error("Failed to read map size from checkpoint.");
+             ifs.close(); return -1;
+         }
+
+        // 4. Node Map Data
+        for (size_t i = 0; i < map_size; ++i) {
+            // Read key length and key
+            size_t key_len;
+            ifs.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+            if (!ifs) { spdlog::error("Failed reading key length at entry {}", i); ifs.close(); return -1; }
+            std::string key(key_len, '\0');
+            ifs.read(&key[0], key_len);
+             if (!ifs) { spdlog::error("Failed reading key data at entry {}", i); ifs.close(); return -1; }
+
+            // Read vector size
+            size_t vec_size;
+            ifs.read(reinterpret_cast<char*>(&vec_size), sizeof(vec_size));
+             if (!ifs) { spdlog::error("Failed reading vector size for key '{}'", key); ifs.close(); return -1; }
+
+            // Create the node using make_unique
+            auto node_ptr = std::make_unique<Node>(vec_size);
+
+            // Read data directly into the node's vectors
+            ifs.read(reinterpret_cast<char*>(node_ptr->regret_sum.data()), vec_size * sizeof(double));
+             if (!ifs) { spdlog::error("Failed reading regret_sum for key '{}'", key); ifs.close(); return -1; }
+
+            ifs.read(reinterpret_cast<char*>(node_ptr->strategy_sum.data()), vec_size * sizeof(double));
+             if (!ifs) { spdlog::error("Failed reading strategy_sum for key '{}'", key); ifs.close(); return -1; }
+
+            // Read visit_count
+            int visits;
+            ifs.read(reinterpret_cast<char*>(&visits), sizeof(visits));
+             if (!ifs) { spdlog::error("Failed reading visit_count for key '{}'", key); ifs.close(); return -1; }
+            node_ptr->visit_count.store(visits, std::memory_order_relaxed);
+
+            // Use try_emplace with std::move into the temporary map
+            temp_node_map.try_emplace(key, std::move(node_ptr));
         }
 
-        // Node Map Data
-        if (!checkpoint_data.contains("node_map")) {
-             spdlog::error("Missing 'node_map' in checkpoint."); return -1;
-        }
+         // Try reading total_nodes_created (handle potential EOF for older versions)
+         ifs.read(reinterpret_cast<char*>(&loaded_nodes_created), sizeof(loaded_nodes_created));
+         if (!ifs) {
+              spdlog::warn("Could not read total_nodes_created from checkpoint (might be older version or corrupted). Estimating based on loaded nodes.");
+              loaded_nodes_created = temp_node_map.size(); // Estimate
+         }
 
-        // --- Manually deserialize the node_map into temp_node_map ---
-        const json& node_map_json = checkpoint_data.at("node_map");
-        if (!node_map_json.is_object()) {
-             spdlog::error("'node_map' in checkpoint is not a JSON object."); return -1;
-        }
+        // Check if we read the expected number of nodes (do this after trying to read nodes_created)
+         if (temp_node_map.size() != map_size) {
+             spdlog::error("Checkpoint file appears truncated or corrupted during node map load. Loaded {} of {} expected entries.", temp_node_map.size(), map_size);
+             ifs.close(); return -1;
+         }
 
-        for (auto it = node_map_json.begin(); it != node_map_json.end(); ++it) {
-            const std::string& key = it.key();
-            const json& node_json = it.value();
-            try {
-                if (!node_json.contains("num_actions")) {
-                     spdlog::error("Missing 'num_actions' for node key '{}'", key); return -1;
-                }
-                size_t num_actions = node_json.at("num_actions").get<size_t>();
 
-                // Create the node using make_unique
-                auto node_ptr = std::make_unique<Node>(num_actions);
-
-                // Populate the constructed node (no lock needed on local node_ptr)
-                node_json.at("regret_sum").get_to(node_ptr->regret_sum);
-                node_json.at("strategy_sum").get_to(node_ptr->strategy_sum);
-                if (node_ptr->regret_sum.size() != num_actions || node_ptr->strategy_sum.size() != num_actions) {
-                     throw std::runtime_error("Mismatch in vector sizes during JSON deserialization");
-                }
-                int visits = 0;
-                node_json.at("visit_count").get_to(visits);
-                node_ptr->visit_count.store(visits, std::memory_order_relaxed);
-
-                // Use try_emplace with std::move into the temporary map
-                temp_node_map.try_emplace(key, std::move(node_ptr));
-
-            } catch (const json::exception& e) {
-                 spdlog::error("Failed to deserialize node for key '{}': {}", key, e.what());
-                 return -1;
-            }
-        }
-        // --- End manual deserialization ---
-
-        if (loaded_nodes_created == 0 || loaded_nodes_created != (long long)temp_node_map.size()) {
-             if (loaded_nodes_created != 0) {
-                 spdlog::warn("Loaded 'total_nodes_created' ({}) differs from loaded map size ({}). Using map size.", loaded_nodes_created, temp_node_map.size());
-             }
-             loaded_nodes_created = temp_node_map.size();
-        }
-
-    } catch (const json::parse_error& e) {
-        spdlog::error("JSON parse error during load: {}", e.what());
-        if(ifs.is_open()) ifs.close(); return -1;
-    } catch (const json::exception& e) {
-         spdlog::error("JSON exception during load: {}", e.what());
-         if(ifs.is_open()) ifs.close(); return -1;
     } catch (const std::exception& e) {
          spdlog::error("Standard exception during load: {}", e.what());
          if(ifs.is_open()) ifs.close(); return -1;
