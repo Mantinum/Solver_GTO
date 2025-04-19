@@ -1,27 +1,36 @@
 #include "action_abstraction.h" // Corrected include
 #include "game_state.h" // Corrected include
 
-#include <iostream> // Keep for std::cerr fallback? Or remove.
+#include <iostream>
 #include <vector>
 #include <string>
-#include "spdlog/spdlog.h" // Include spdlog
-#include <algorithm> // For std::min, std::max
-#include <cmath>     // For std::round
 #include <set>       // For std::set (used for unique actions)
+#include <cmath>     // For std::round, std::max
+#include <algorithm> // For std::min
+#include <map>       // For mapping context to actions
+#include <sstream>   // Include stringstream for formatting doubles
+#include <iomanip>   // Include iomanip for setprecision
+
+#include "spdlog/spdlog.h" // Include spdlog
 
 namespace gto_solver {
 
-// Assume Big Blind size is needed for calculations (could be passed or stored)
-const int BIG_BLIND_SIZE = 2; // Example BB size
+// Assume Big Blind size is needed for calculations
+// TODO: Make this configurable or get from GameState if possible
+const int BIG_BLIND_SIZE = 2;
 
-// Helper function to create action string from fraction
-std::string create_bet_action_string(double fraction) {
-    return "bet_" + std::to_string(static_cast<int>(fraction * 100)) + "pct";
-}
-
-// Helper function to create action string from fraction (for raises)
-std::string create_raise_action_string(double fraction) {
-    return "raise_" + std::to_string(static_cast<int>(fraction * 100)) + "pct";
+// Helper function to create action string with amount
+std::string create_action_string(const std::string& base, double value, const std::string& unit) {
+    // Format to one decimal place if needed, otherwise integer
+    std::string val_str;
+    if (std::abs(value - std::round(value)) < 1e-5) { // Check if it's effectively an integer
+        val_str = std::to_string(static_cast<int>(value));
+    } else {
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(1) << value;
+        val_str = ss.str();
+    }
+    return base + "_" + val_str + unit;
 }
 
 
@@ -30,132 +39,143 @@ ActionAbstraction::ActionAbstraction() {
 }
 
 std::vector<std::string> ActionAbstraction::get_possible_actions(const GameState& current_state) const {
-    std::vector<std::string> actions;
+    std::set<std::string> actions_set; // Use set to avoid duplicates initially
     int current_player = current_state.get_current_player();
     int player_stack = current_state.get_player_stacks()[current_player];
     int amount_to_call = current_state.get_amount_to_call(current_player);
+    int current_bet = current_state.get_bet_this_round(current_player);
+    Street street = current_state.get_current_street();
+    int effective_stack = current_state.get_effective_stack(current_player); // Use helper
 
     if (player_stack <= 0) {
-        return {}; // No actions if player has no stack (folded or all-in previously)
+        return {}; // No actions if player has no stack
     }
 
-    // 1. Fold is always possible
-    actions.push_back("fold");
+    // 1. Fold Action (Always possible if facing a bet)
+    if (amount_to_call > 0) {
+        actions_set.insert("fold");
+    }
 
-    // 2. Check or Call
+    // 2. Check or Call Action
     if (amount_to_call == 0) {
-        actions.push_back("check");
+        actions_set.insert("check");
     } else {
         // Can always attempt to call (even if it results in all-in for less)
-        actions.push_back("call");
+        actions_set.insert("call");
     }
 
-    // 3. Bet or Raise
-    // Can only bet/raise if stack > amount_to_call (must have chips left after calling)
+    // 3. Bet or Raise Actions (Only if stack > amount_to_call)
     if (player_stack > amount_to_call) {
-        bool is_facing_bet_or_raise = amount_to_call > 0;
+        bool facing_bet_or_raise = amount_to_call > 0;
+        int num_raises = current_state.get_raises_this_street(); // Use helper
+        int num_limpers = current_state.get_num_limpers(); // Use helper
 
-        // --- Preflop Sizing ---
-        if (current_state.get_current_street() == Street::PREFLOP) {
-            if (!is_facing_bet_or_raise) { // Open Raise Sizings
-                 // Add multiple open raise sizes
-                 actions.push_back("raise_2.2bb");
-                 actions.push_back("raise_2.5bb");
-                 actions.push_back("raise_3bb");
-            } else { // Re-raise (3bet, 4bet...)
-                 // Add multiplier-based re-raise sizing
-                 actions.push_back("raise_2.2x"); // Added 2.2x re-raise
-                 actions.push_back("raise_2.5x"); // Added 2.5x re-raise
-                 actions.push_back("raise_3x");   // Kept 3x re-raise
-                 // TODO: Add more sophisticated re-raise sizing logic if needed (e.g., pot size)
+        // --- Preflop Abstraction ---
+        if (street == Street::PREFLOP) {
+            int sb_index = (current_state.get_button_position() + 1) % current_state.get_num_players();
+             if (current_state.get_num_players() == 2) sb_index = current_state.get_button_position(); // HU case
+
+            if (!facing_bet_or_raise && num_limpers == 0) { // RFI or SB complete/raise vs BB check
+                 if (current_player == sb_index && current_state.get_num_players() == 2) { // SB first action HU
+                      actions_set.insert("raise_3x"); // Standard SB open size
+                      // Optionally add Limp for SB HU/BvB
+                      // actions_set.insert("call"); // Represent Limp as Call
+                 } else if (current_state.is_first_to_act_preflop(current_player)) { // RFI from other positions
+                      // Depth-dependent RFI sizing
+                      double open_size_bb = 2.3; // Default for >= 40bb
+                      if (effective_stack < 25 * BIG_BLIND_SIZE) open_size_bb = 2.0;
+                      else if (effective_stack < 35 * BIG_BLIND_SIZE) open_size_bb = 2.1;
+                      else if (effective_stack < 40 * BIG_BLIND_SIZE) open_size_bb = 2.2;
+                      actions_set.insert(create_action_string("raise", open_size_bb, "bb"));
+                 }
+                 // BB check option is handled by adding "check" earlier
             }
-        }
-        // --- Postflop Sizing ---
-        else {
-             if (!is_facing_bet_or_raise) { // Bet sizing
-                 actions.push_back(create_bet_action_string(BET_FRACTION_SMALL));  // e.g., "bet_33pct"
-                 actions.push_back(create_bet_action_string(BET_FRACTION_MEDIUM)); // e.g., "bet_50pct"
-                 actions.push_back(create_bet_action_string(BET_FRACTION_LARGE));  // e.g., "bet_75pct"
-                 // actions.push_back(create_bet_action_string(BET_FRACTION_OVERBET)); // If needed later
-             } else { // Raise sizing
-                 // Add more sophisticated raise sizing logic (e.g., 2x, 2.5x raise)
-                 actions.push_back("raise_pot");
-                 actions.push_back("raise_2.0x"); // Added 2.0x raise
-                 actions.push_back("raise_2.5x"); // Added 2.5x raise
-                 // actions.push_back(create_raise_action_string(BET_FRACTION_LARGE)); // Example: raise 75% pot
-             }
-        }
-
-        // Always allow going all-in if possible (if not already covered by other sizes)
-        // TODO: Check if any generated bet/raise size is already effectively all-in
-        actions.push_back("all_in");
-    }
-
-    // TODO: Remove duplicate actions if generated (e.g., if raise_pot results in all-in)
-    // Example: Sort and unique, but requires careful handling if amounts differ slightly
-    // Use a set to store unique valid actions
-    std::set<std::string> unique_actions;
-    for(const auto& action : actions) {
-        unique_actions.insert(action); // Add fold, check/call
-    }
-
-    // Calculate potential bet/raise actions and add unique ones
-    if (player_stack > amount_to_call) {
-        std::vector<std::string> potential_bet_raise_strs;
-        bool is_facing_bet_or_raise = amount_to_call > 0;
-
-        // --- Generate potential action strings ---
-        if (current_state.get_current_street() == Street::PREFLOP) {
-            if (!is_facing_bet_or_raise) { // Open Raise Sizings
-                 potential_bet_raise_strs.push_back("raise_2.2bb");
-                 potential_bet_raise_strs.push_back("raise_2.5bb");
-                 potential_bet_raise_strs.push_back("raise_3bb");
-            } else { // Re-raise (3bet, 4bet...)
-                 potential_bet_raise_strs.push_back("raise_2.2x"); // Added 2.2x re-raise
-                 potential_bet_raise_strs.push_back("raise_2.5x"); // Added 2.5x re-raise
-                 potential_bet_raise_strs.push_back("raise_3x");   // Kept 3x re-raise
-                 // potential_bet_raise_strs.push_back("raise_pot"); // Add if needed
+            else if (!facing_bet_or_raise && num_limpers > 0) { // Facing limper(s) -> Iso-raise or Overlimp
+                 actions_set.insert("call"); // Option to overlimp
+                 // Iso-raise sizing (e.g., 3bb + 1bb per limper)
+                 double iso_size_bb = 3.0 + num_limpers;
+                 actions_set.insert(create_action_string("raise", iso_size_bb, "bb"));
             }
-        } else { // Postflop Sizing
-             if (!is_facing_bet_or_raise) { // Bet sizing
-                 potential_bet_raise_strs.push_back(create_bet_action_string(BET_FRACTION_SMALL));
-                 potential_bet_raise_strs.push_back(create_bet_action_string(BET_FRACTION_MEDIUM));
-                  potential_bet_raise_strs.push_back(create_bet_action_string(BET_FRACTION_LARGE));
-              } else { // Raise sizing
-                  potential_bet_raise_strs.push_back("raise_pot");
-                  potential_bet_raise_strs.push_back("raise_2.0x"); // Added 2.0x raise
-                  potential_bet_raise_strs.push_back("raise_2.5x"); // Added 2.5x raise
-                  // potential_bet_raise_strs.push_back(create_raise_action_string(BET_FRACTION_LARGE));
-              }
-         }
-        potential_bet_raise_strs.push_back("all_in"); // Always consider all-in
-
-        // --- Calculate amounts and filter unique actions ---
-        int all_in_amount = get_action_amount("all_in", current_state);
-        std::set<int> unique_amounts; // Track amounts to detect duplicates
-
-        for (const std::string& action_str : potential_bet_raise_strs) {
-            int amount = get_action_amount(action_str, current_state);
-            if (amount != -1) { // Check if amount calculation was valid
-                 // Ensure the action is legal (amount > amount_to_call or it's an all-in)
-                 int current_bet = current_state.get_bet_this_round(current_player);
-                 if (amount > current_bet + amount_to_call || amount == player_stack + current_bet) {
-                     // Check if this amount leads to the same result as all-in
-                     if (amount == all_in_amount) {
-                         unique_actions.insert("all_in"); // Prefer "all_in" string
-                         unique_amounts.insert(amount);
-                     } else if (unique_amounts.find(amount) == unique_amounts.end()) {
-                         // Only add if the resulting amount is unique
-                         unique_actions.insert(action_str);
-                         unique_amounts.insert(amount);
-                     }
+            else if (facing_bet_or_raise) { // Facing a raise (2bet, 3bet, 4bet...)
+                 if (num_raises == 1) { // Facing an open raise -> 3Bet or Call
+                      // Add standard 3bet sizings (IP vs OOP)
+                      // TODO: Need position info relative to raiser
+                      // Simplified: Use one size for now
+                      double three_bet_size_x = 3.5; // Average size
+                      actions_set.insert(create_action_string("raise", three_bet_size_x, "x"));
+                 } else if (num_raises == 2) { // Facing a 3bet -> 4Bet or Call
+                      // Simplified: Only offer All-in as 4bet/5bet+
+                      // actions_set.insert(create_action_string("raise", 2.2, "x")); // Optional smaller 4bet
+                      actions_set.insert("all_in");
+                 } else { // Facing 4bet or higher
+                      // Only offer All-in or Fold/Call
+                       actions_set.insert("all_in");
                  }
             }
+             // Always add All-in preflop if not already covered and affordable
+             actions_set.insert("all_in");
+
+        }
+        // --- Postflop Abstraction ---
+        else {
+             if (!facing_bet_or_raise) { // Option to Bet
+                  actions_set.insert(create_action_string("bet", 33, "pct")); // Use unified helper
+                  actions_set.insert(create_action_string("bet", 75, "pct")); // Use unified helper
+             } else { // Option to Raise
+                  actions_set.insert("raise_pot"); // Pot size raise
+                  actions_set.insert(create_action_string("raise", 2.5, "x")); // Use unified helper
+             }
+             // Always add All-in postflop if affordable
+             actions_set.insert("all_in");
         }
     }
 
-    // Convert set back to vector
-    return std::vector<std::string>(unique_actions.begin(), unique_actions.end());
+    // --- Final Filtering ---
+    std::vector<std::string> final_actions;
+    std::set<int> unique_amounts; // Track amounts to avoid redundant actions like raise_3x == all_in
+    int all_in_amount = -1; // Calculate only if needed
+
+    for (const std::string& action_str : actions_set) {
+        int amount = get_action_amount(action_str, current_state);
+
+        if (amount == -1) { // Fold, Check, Call
+            final_actions.push_back(action_str);
+        } else {
+            // Check if amount is valid (greater than current bet + call amount, unless it's all-in)
+            int min_legal_total_bet = current_bet + amount_to_call + std::max(1, current_state.get_last_raise_size()); // Simplified min raise check
+             if (amount == current_bet + player_stack) { // Is this action effectively all-in?
+                 if (all_in_amount == -1) all_in_amount = amount; // Calculate all_in amount once
+                 if (unique_amounts.find(all_in_amount) == unique_amounts.end()) {
+                      final_actions.push_back("all_in"); // Prefer "all_in" string
+                      unique_amounts.insert(all_in_amount);
+                 }
+             } else if (amount >= min_legal_total_bet) { // Is it a valid raise/bet size?
+                  if (unique_amounts.find(amount) == unique_amounts.end()) {
+                       final_actions.push_back(action_str);
+                       unique_amounts.insert(amount);
+                  }
+             } else {
+                  // spdlog::trace("Filtering out invalid/sub-minimal action: {} (amount {})", action_str, amount);
+             }
+        }
+    }
+
+    // Ensure "all_in" is present if it's the only valid raise/bet option left after filtering
+    if (player_stack > amount_to_call && unique_amounts.empty() && actions_set.count("all_in")) {
+         if (all_in_amount == -1) all_in_amount = get_action_amount("all_in", current_state);
+         if (all_in_amount > current_bet + amount_to_call) { // Check if all-in is actually a valid raise
+              // Check if "all_in" wasn't already added
+              bool already_added = false;
+              for(const auto& fa : final_actions) { if (fa == "all_in") { already_added = true; break; } }
+              if (!already_added) final_actions.push_back("all_in");
+         }
+    }
+
+
+    // Sort actions for consistency (optional, but good for debugging/comparison)
+    // std::sort(final_actions.begin(), final_actions.end());
+
+    return final_actions;
 }
 
 
@@ -165,109 +185,79 @@ int ActionAbstraction::get_action_amount(const std::string& action_str, const Ga
     int player_stack = current_state.get_player_stacks()[current_player];
     int amount_to_call = current_state.get_amount_to_call(current_player);
     int current_pot = current_state.get_pot_size();
-    int current_bet = current_state.get_bet_this_round(current_player); // Amount already invested this round
+    int current_bet = current_state.get_bet_this_round(current_player);
 
     // Calculate effective pot size (including current round bets) for pot-relative sizing
-    int effective_pot = current_pot;
-    for(int bet : current_state.get_bets_this_round()) {
-         effective_pot += bet;
-    }
+    int effective_pot = current_pot; // Pot size *before* current action
+    // Correct effective pot: pot + all bets currently on the table
+    effective_pot = current_state.get_pot_size();
+
 
     if (action_str == "fold" || action_str == "call" || action_str == "check") {
         return -1; // No amount associated
     } else if (action_str == "all_in") {
-        // Total amount committed after going all-in is the player's starting stack for the round
-        return player_stack + current_bet;
+        return player_stack + current_bet; // Total amount committed
     } else if (action_str.find("raise_") != std::string::npos || action_str.find("bet_") != std::string::npos) {
-        int target_total_bet = -1; // The total amount the player wants to have bet this round
+        int target_total_bet = -1;
 
-        // --- Preflop BB Raise (Handles 2.2bb, 2.5bb, 3bb etc.) ---
+        // --- Preflop BB Raise (e.g., raise_2.3bb) ---
         if (action_str.find("bb") != std::string::npos) {
              size_t start = action_str.find('_') + 1;
              size_t end = action_str.find("bb");
              if (start != std::string::npos && end != std::string::npos && end > start) {
                  try {
-                     // Use stod to handle decimals like 2.2, 2.5
                      double bbs = std::stod(action_str.substr(start, end - start));
                      target_total_bet = static_cast<int>(std::round(bbs * BIG_BLIND_SIZE));
-                 } catch (const std::invalid_argument& e) {
-                     spdlog::error("Invalid BB amount (stod) in action string: {}", action_str);
-                 } catch (const std::out_of_range& e) {
-                     spdlog::error("BB amount out of range in action string: {}", action_str);
-                 }
+                 } catch (...) { /* Handle exceptions */ spdlog::error("Invalid BB amount in action: {}", action_str); }
              }
         }
-        // --- Percentage Bet/Raise (Pot Relative) ---
-        else if (action_str.find("pct") != std::string::npos) {
+        // --- Percentage Bet (e.g., bet_33pct) ---
+        else if (action_str.find("bet_") != std::string::npos && action_str.find("pct") != std::string::npos) {
              size_t start = action_str.find('_') + 1;
              size_t end = action_str.find("pct");
              if (start != std::string::npos && end != std::string::npos && end > start) {
                  try {
                      double fraction = std::stod(action_str.substr(start, end - start)) / 100.0;
-                     int bet_or_raise_increment = static_cast<int>(std::round(effective_pot * fraction));
-                     // Amount is added ON TOP of the call amount if raising
-                     target_total_bet = current_bet + amount_to_call + bet_or_raise_increment;
-                 } catch (const std::invalid_argument& e) {
-                     spdlog::error("Invalid percentage amount in action string: {}", action_str);
-                 } catch (const std::out_of_range& e) {
-                     spdlog::error("Percentage amount out of range in action string: {}", action_str);
-                 }
+                     int bet_increment = static_cast<int>(std::round(effective_pot * fraction));
+                     target_total_bet = current_bet + bet_increment; // Bet amount is total commit
+                 } catch (...) { /* Handle exceptions */ spdlog::error("Invalid PCT amount in action: {}", action_str); }
               }
           }
-          // --- Multiplier Raise (Handles 2.0x, 2.5x etc.) ---
+        // --- Percentage Raise (e.g., raise_75pct) ---
+         else if (action_str.find("raise_") != std::string::npos && action_str.find("pct") != std::string::npos) {
+             size_t start = action_str.find('_') + 1;
+             size_t end = action_str.find("pct");
+             if (start != std::string::npos && end != std::string::npos && end > start) {
+                 try {
+                     double fraction = std::stod(action_str.substr(start, end - start)) / 100.0;
+                     int pot_after_call = effective_pot + amount_to_call; // Pot size *after* calling
+                     int raise_increment = static_cast<int>(std::round(pot_after_call * fraction));
+                     target_total_bet = current_bet + amount_to_call + raise_increment;
+                 } catch (...) { /* Handle exceptions */ spdlog::error("Invalid PCT amount in action: {}", action_str); }
+              }
+          }
+          // --- Multiplier Raise (e.g., raise_3.5x) ---
           else if (action_str.find("raise_") != std::string::npos && action_str.find("x") == action_str.length() - 1) {
                 size_t start = action_str.find('_') + 1;
                 size_t end = action_str.find("x");
                 if (start != std::string::npos && end != std::string::npos && end > start) {
                     try {
                         double multiplier = std::stod(action_str.substr(start, end - start));
-                        int last_bet_or_raise = 0;
-                        // Find the amount of the last bet/raise this street
-                        int max_bet_this_round = 0;
-                        for(int bet : current_state.get_bets_this_round()) max_bet_this_round = std::max(max_bet_this_round, bet);
-                        // The amount the current player needs to call represents the size of the bet/raise they are facing
-                        last_bet_or_raise = amount_to_call; // This is the *additional* amount needed to call
-
-                        // If amount_to_call is 0, it means we are the first to bet this street (postflop),
-                        // which shouldn't happen for a "raise_Nx" action. Log a warning.
-                        // Or, if preflop, it might be an open raise scenario, but these use "bb" sizing.
-                        // Let's assume this sizing is primarily for *re-raises*.
-                        if (last_bet_or_raise <= 0) {
-                             spdlog::warn("Multiplier raise '{}' used when not facing a bet/raise (amount_to_call={}). Using BB as fallback increment.", action_str, amount_to_call);
-                             last_bet_or_raise = BIG_BLIND_SIZE; // Fallback, might need refinement
+                        int last_bet_or_raise_amount = current_state.get_last_raise_size(); // Use the increment size
+                        if (last_bet_or_raise_amount <= 0) { // Facing limp or BB preflop, or check postflop
+                             // Base raise on the pot size instead? Or BB? Use BB for now preflop.
+                             last_bet_or_raise_amount = BIG_BLIND_SIZE;
+                             spdlog::warn("Multiplier raise '{}' used when last raise size <=0. Basing multiplier on BB.", action_str);
                         }
-
-                        int raise_increment = static_cast<int>(std::round(static_cast<double>(last_bet_or_raise) * multiplier));
+                        // Raise BY multiplier * previous raise increment
+                        int raise_increment = static_cast<int>(std::round(static_cast<double>(last_bet_or_raise_amount) * multiplier));
                         target_total_bet = current_bet + amount_to_call + raise_increment;
 
-                    } catch (const std::invalid_argument& e) {
-                        spdlog::error("Invalid multiplier amount (stod) in action string: {}", action_str);
-                    } catch (const std::out_of_range& e) {
-                        spdlog::error("Multiplier amount out of range in action string: {}", action_str);
-                    }
+                    } catch (...) { /* Handle exceptions */ spdlog::error("Invalid multiplier amount in action: {}", action_str); }
                 }
           }
-          // --- Preflop 3x Raise ---
-          else if (action_str == "raise_3x") {
-              int last_raise = current_state.get_last_raise_size();
-              if (last_raise <= 0) { // Should not happen if facing a bet/raise (unless it's the first raise vs BB)
-                  // If facing only the BB post, the 'last_raise' might be BB-SB.
-                  // A more robust way is to consider the amount needed to call.
-                  int effective_last_raise = (amount_to_call > 0) ? amount_to_call : BIG_BLIND_SIZE;
-                  spdlog::warn("raise_3x called but last_raise_size is not positive ({}). Using effective raise: {}", last_raise, effective_last_raise);
-                  last_raise = effective_last_raise;
-              }
-              // A 3x raise usually means raising *by* 3 times the previous bet/raise amount,
-              // or raising *to* 3 times the previous bet/raise amount. Let's assume raising *to* 3x the previous total bet size.
-              // Example: Blinds 1/2. BTN raises to 6 (BB). SB wants to 3bet 3x. Raise TO 18.
-              // Example: Blinds 1/2. BTN raises to 6. SB calls 6. BB wants to squeeze 3x. Raise TO 18? Or 3x the raise size (6-2=4)? Let's use 3x the raise size increment.
-              // Raise increment = 3 * last_raise_size.
-              int raise_increment = last_raise * 3;
-              target_total_bet = current_bet + amount_to_call + raise_increment;
-          }
-          // --- Pot Size Raise (Postflop for now) ---
-          else if (action_str == "raise_pot") { // Applies to postflop raise for now
-             // Pot size raise amount = size of the pot *after* the player calls
+          // --- Pot Size Raise ---
+          else if (action_str == "raise_pot") {
              int pot_after_call = effective_pot + amount_to_call;
              int pot_raise_increment = pot_after_call;
              target_total_bet = current_bet + amount_to_call + pot_raise_increment;
@@ -276,12 +266,7 @@ int ActionAbstraction::get_action_amount(const std::string& action_str, const Ga
         if (target_total_bet != -1) {
             // --- Apply Min-Raise Rules ---
             int last_raise_size = current_state.get_last_raise_size();
-            // If no raise has occurred yet this street, the minimum raise is typically the size of the big blind (or the initial bet size postflop).
-            // For simplicity, we'll use the Big Blind size as the default minimum increment if last_raise_size is 0.
-            // A more robust implementation might track the initial bet size postflop.
             int min_raise_increment = (last_raise_size > 0) ? last_raise_size : BIG_BLIND_SIZE;
-
-            // Calculate the minimum legal total bet amount for this player
             int min_legal_total_bet = current_bet + amount_to_call + min_raise_increment;
 
             // Ensure the calculated total bet meets the minimum legal raise

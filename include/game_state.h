@@ -62,6 +62,10 @@ public:
 
     // --- Utility ---
     std::string get_history_string() const; // Get a string representation of the action history
+    int get_effective_stack(int player_index) const; // Smallest stack among active players including player_index
+    int get_raises_this_street() const; // Count number of raises in the current street's history
+    bool is_first_to_act_preflop(int player_index) const; // Check if player is first voluntary actor preflop
+    int get_num_limpers() const; // Count number of limpers preflop before current player
 
 private:
     int num_players_;
