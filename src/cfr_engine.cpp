@@ -12,7 +12,7 @@
 #include <numeric>   // For std::accumulate
 #include <algorithm> // For std::max, std::shuffle, std::min, std::min_element, std::max_element
 #include <stdexcept> // For exceptions
-#include <random>    // For std::mt19937, std::random_device, std::discrete_distribution // Added discrete_distribution
+#include <random>    // For std::mt19937, std::random_device, std::discrete_distribution
 #include <chrono>    // For seeding RNG
 #include <utility>   // For std::pair, std::move
 #include <thread>    // For std::thread
@@ -72,19 +72,27 @@ CFREngine::CFREngine()
     spdlog::debug("CFREngine created");
 }
 
-// Recursive MCCFR function (External Sampling) - Takes RNG reference
+// Recursive MCCFR function (External Sampling) - Takes RNG reference and depth
 double CFREngine::cfr_plus_recursive(
     GameState current_state,
     int traversing_player,
     const std::vector<double>& reach_probabilities,
     std::vector<Card>& deck,
     int& card_idx,
-    std::mt19937& rng // Pass RNG by reference
+    std::mt19937& rng,
+    int depth // Added depth parameter
 ) {
+    // --- Update Max Depth Reached ---
+    // Use fetch_max for atomic update if current depth is greater
+    int current_max_depth = max_depth_reached_.load(std::memory_order_relaxed);
+    if (depth > current_max_depth) {
+        max_depth_reached_.compare_exchange_strong(current_max_depth, depth); // Attempt atomic update
+    }
+
     // --- 1. Check for Terminal State ---
-    // (Terminal state logic remains the same)
      Street entry_street = current_state.get_current_street();
     if (current_state.is_terminal()) {
+        // spdlog::trace("Depth {}: Terminal state reached.", depth); // DEBUG LOG
         // ... (payoff calculation logic is unchanged) ...
         double final_payoff = 0.0;
         int num_players = current_state.get_num_players();
@@ -125,7 +133,7 @@ double CFREngine::cfr_plus_recursive(
                                  current_ranks[eligible_player_index] = hand_evaluator_.evaluate_7_card_hand(hand, community_cards);
                                  best_rank = std::min(best_rank, current_ranks[eligible_player_index]);
                              } else {
-                                 spdlog::warn("Showdown occurred but player {} has invalid hand size {}. History: {}", eligible_player_index, hand.size(), current_state.get_history_string());
+                                 // spdlog::warn("Showdown occurred but player {} has invalid hand size {}. History: {}", eligible_player_index, hand.size(), current_state.get_history_string());
                                  current_ranks[eligible_player_index] = 9999;
                              }
                         }
@@ -133,7 +141,7 @@ double CFREngine::cfr_plus_recursive(
                             if (current_ranks[eligible_player_index] == best_rank) current_winners.push_back(eligible_player_index);
                         }
                     } else {
-                         spdlog::debug("Showdown before river ({} cards) for pot level {}. Splitting pot segment.", community_cards.size(), current_contribution_level);
+                         // spdlog::debug("Showdown before river ({} cards) for pot level {}. Splitting pot segment.", community_cards.size(), current_contribution_level);
                          current_winners = current_pot_eligible_players;
                     }
                     if (!current_winners.empty()) {
@@ -158,7 +166,7 @@ double CFREngine::cfr_plus_recursive(
     // --- 2. Get InfoSet and Node ---
     int current_player = current_state.get_current_player();
      if (current_state.get_player_hand(current_player).empty()) {
-         spdlog::debug("Player {} has no hand in non-terminal state (likely just folded). History: {}", current_player, current_state.get_history_string());
+         // spdlog::debug("Player {} has no hand in non-terminal state (likely just folded). History: {}", current_player, current_state.get_history_string());
          return 0.0;
      }
     InfoSet info_set(current_state.get_player_hand(current_player), current_state.get_history_string());
@@ -168,7 +176,7 @@ double CFREngine::cfr_plus_recursive(
     size_t num_actions = legal_actions_str.size();
 
     if (num_actions == 0) {
-         spdlog::debug("No legal actions found for player {} in non-terminal state. History: {}", current_player, current_state.get_history_string());
+         // spdlog::debug("No legal actions found for player {} in non-terminal state. History: {}", current_player, current_state.get_history_string());
          return 0.0;
     }
 
@@ -178,12 +186,12 @@ double CFREngine::cfr_plus_recursive(
         std::lock_guard<std::mutex> lock(node_map_mutex_);
         auto it = node_map_.find(info_set_key);
         if (it == node_map_.end()) {
-            // spdlog::trace("Creating node: {}", info_set_key); // DEBUG LOG
+            // spdlog::trace("Depth {}: Creating node: {}", depth, info_set_key); // DEBUG LOG
             auto emplace_result = node_map_.emplace(info_set_key, std::make_unique<Node>(num_actions));
             node_ptr = emplace_result.first->second.get();
             total_nodes_created_++;
         } else {
-            // spdlog::trace("Found node: {}", info_set_key); // DEBUG LOG
+            // spdlog::trace("Depth {}: Found node: {}", depth, info_set_key); // DEBUG LOG
             node_ptr = it->second.get();
         }
     }
@@ -208,34 +216,29 @@ double CFREngine::cfr_plus_recursive(
     if (current_player != traversing_player) {
         // --- Opponent's Turn: Sample one action ---
         size_t sampled_action_idx = 0;
-        if (!current_strategy.empty()) { // Avoid error on empty strategy
-             // Ensure probabilities are valid for discrete_distribution
+        if (!current_strategy.empty()) {
              bool all_zero = true;
              for(double p : current_strategy) { if (p > 0) { all_zero = false; break; } }
-             if (all_zero && !current_strategy.empty()) {
-                  // If all probabilities are zero (e.g., due to floating point issues or no positive regrets),
-                  // default to uniform sampling over legal actions.
+             if (all_zero) {
                   std::uniform_int_distribution<size_t> uniform_dist(0, current_strategy.size() - 1);
                   sampled_action_idx = uniform_dist(rng);
              } else {
                   try {
                        std::discrete_distribution<size_t> dist(current_strategy.begin(), current_strategy.end());
-                       sampled_action_idx = dist(rng); // Use the passed RNG
+                       sampled_action_idx = dist(rng);
                   } catch (const std::exception& e) {
-                       // Handle potential exceptions from discrete_distribution (e.g., if weights sum to zero or contain negatives/NaN)
                        spdlog::error("Error creating discrete_distribution for node {}: {}. Strategy: [{}]", info_set_key, e.what(), fmt::join(current_strategy, ", "));
-                       // Fallback to uniform sampling or return error
                        std::uniform_int_distribution<size_t> uniform_dist(0, current_strategy.size() - 1);
                        sampled_action_idx = uniform_dist(rng);
                   }
              }
         } else {
              spdlog::error("Empty strategy for opponent node: {}", info_set_key);
-             return 0.0; // Cannot sample
+             return 0.0;
         }
 
-
         const std::string& action_str = legal_actions_str[sampled_action_idx];
+        // spdlog::trace("Depth {}: Player {} sampled action: {}", depth, current_player, action_str); // DEBUG LOG
         Action action;
         action.player_index = current_player;
         // (Action parsing logic...)
@@ -245,16 +248,17 @@ double CFREngine::cfr_plus_recursive(
         else if (action_str.find("raise") != std::string::npos || action_str.find("bet") != std::string::npos || action_str == "all_in") {
              action.type = (current_state.get_amount_to_call(current_player) == 0) ? Action::Type::BET : Action::Type::RAISE;
              action.amount = action_abstraction_.get_action_amount(action_str, current_state);
-             if (action.amount == -1) return 0.0; // Error in amount calculation
+             if (action.amount == -1) return 0.0;
         } else { throw std::logic_error("Unsupported action string: " + action_str); }
 
         GameState next_state = current_state;
-        try { next_state.apply_action(action); } catch (...) { return 0.0; /* Handle error */ }
+        try { next_state.apply_action(action); } catch (...) { return 0.0; }
 
         // (Community card dealing logic...)
         Street next_street = next_state.get_current_street();
         int current_card_idx = card_idx;
         if (next_street != entry_street && next_street != Street::SHOWDOWN) {
+             // spdlog::trace("Depth {}: Dealing cards for {}", depth, static_cast<int>(next_street)); // DEBUG LOG
              std::vector<Card> cards_to_deal;
             int num_cards_to_deal = 0;
             if (next_street == Street::FLOP && entry_street == Street::PREFLOP) num_cards_to_deal = 3;
@@ -264,23 +268,20 @@ double CFREngine::cfr_plus_recursive(
                 if (card_idx + num_cards_to_deal <= deck.size()) {
                     for(int k=0; k<num_cards_to_deal; ++k) cards_to_deal.push_back(deck[card_idx++]);
                     next_state.deal_community_cards(cards_to_deal);
-                } else { card_idx = current_card_idx; return 0.0; /* Error */ }
+                } else { card_idx = current_card_idx; return 0.0; }
             }
         }
 
         std::vector<double> next_reach_probabilities = reach_probabilities;
-        // Update opponent reach probability using the sampled action's probability
-        if (sampled_action_idx < current_strategy.size() && current_strategy[sampled_action_idx] > 1e-9) { // Avoid multiplying by zero and check bounds
+        if (sampled_action_idx < current_strategy.size() && current_strategy[sampled_action_idx] > 1e-9) {
              next_reach_probabilities[current_player] *= current_strategy[sampled_action_idx];
         } else {
-             // If sampled action has zero probability, the path technically shouldn't be reached.
-             return 0.0; // Return 0 utility for this path
+             return 0.0;
         }
 
-
-        // Recursive call for the sampled action, passing RNG down
-        node_utility = -cfr_plus_recursive(next_state, traversing_player, next_reach_probabilities, deck, card_idx, rng);
-        card_idx = current_card_idx; // Restore card index
+        // Recursive call for the sampled action, passing RNG and incremented depth
+        node_utility = -cfr_plus_recursive(next_state, traversing_player, next_reach_probabilities, deck, card_idx, rng, depth + 1);
+        card_idx = current_card_idx;
 
     } else {
         // --- Traversing Player's Turn: Explore all actions ---
@@ -299,12 +300,13 @@ double CFREngine::cfr_plus_recursive(
              } else { throw std::logic_error("Unsupported action string: " + action_str); }
 
             GameState next_state = current_state;
-             try { next_state.apply_action(action); } catch (...) { continue; /* Handle error */ }
+             try { next_state.apply_action(action); } catch (...) { continue; }
 
             // (Community card dealing logic...)
              Street next_street = next_state.get_current_street();
              int current_card_idx = card_idx;
              if (next_street != entry_street && next_street != Street::SHOWDOWN) {
+                 // spdlog::trace("Depth {}: Dealing cards for {}", depth, static_cast<int>(next_street)); // DEBUG LOG
                  std::vector<Card> cards_to_deal;
                  int num_cards_to_deal = 0;
                  if (next_street == Street::FLOP && entry_street == Street::PREFLOP) num_cards_to_deal = 3;
@@ -314,14 +316,13 @@ double CFREngine::cfr_plus_recursive(
                      if (card_idx + num_cards_to_deal <= deck.size()) {
                          for(int k=0; k<num_cards_to_deal; ++k) cards_to_deal.push_back(deck[card_idx++]);
                          next_state.deal_community_cards(cards_to_deal);
-                     } else { card_idx = current_card_idx; continue; /* Error */ }
+                     } else { card_idx = current_card_idx; continue; }
                  }
              }
 
-            // Reach probabilities remain the same for the traversing player's actions
-            // Pass RNG down
-            action_utilities[i] = -cfr_plus_recursive(next_state, traversing_player, reach_probabilities, deck, card_idx, rng);
-            card_idx = current_card_idx; // Restore card index
+            // Pass RNG down, increment depth
+            action_utilities[i] = -cfr_plus_recursive(next_state, traversing_player, reach_probabilities, deck, card_idx, rng, depth + 1);
+            card_idx = current_card_idx;
             node_utility += current_strategy[i] * action_utilities[i];
         }
 
@@ -388,6 +389,7 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
     completed_iterations_ = starting_iteration;
     if (starting_iteration == 0) total_nodes_created_ = 0;
     last_logged_percent_ = -1;
+    max_depth_reached_ = 0; // Reset max depth tracker
     unsigned int hardware_threads = std::thread::hardware_concurrency();
     unsigned int threads_to_use = (num_threads <= 0) ? hardware_threads : std::min((unsigned int)num_threads, hardware_threads);
     if (threads_to_use == 0) threads_to_use = 1;
@@ -430,8 +432,8 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
                 std::vector<double> initial_reach_probs(num_players, 1.0);
                 int current_card_idx = card_index;
                 try {
-                    // Pass the thread-local RNG to the recursive function
-                    cfr_plus_recursive(root_state, player, initial_reach_probs, deck, current_card_idx, rng);
+                    // Pass the thread-local RNG and initial depth 0
+                    cfr_plus_recursive(root_state, player, initial_reach_probs, deck, current_card_idx, rng, 0);
                 } catch (const std::exception& e) {
                      spdlog::error("[Thread {}] Exception in cfr_plus_recursive: {}", thread_id, e.what());
                 }
@@ -439,7 +441,6 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
             // (Progress logging and checkpointing remain the same)
             int current_completed = completed_iterations_++;
             if (thread_id == 0) { /* ... log progress ... */
-                 // Calculate percentage based on total iterations requested
                  int current_percent = static_cast<int>((static_cast<double>(current_completed + 1) / iterations) * 100.0);
                  int last_logged = last_logged_percent_.load(std::memory_order_relaxed);
 
@@ -454,7 +455,6 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
             }
              if (thread_id == 0 && !save_filename.empty() && checkpoint_interval > 0) { /* ... save checkpoint ... */
                   int completed_count = current_completed + 1; // Use the value *after* increment
-                  // Check if enough iterations passed since last checkpoint *count*
                   if (completed_count / checkpoint_interval > last_checkpoint_iter_count) {
                       last_checkpoint_iter_count = completed_count / checkpoint_interval; // Update count
                       spdlog::info("[Thread 0] Reached checkpoint interval (around iteration {}). Saving state...", completed_count);
@@ -499,12 +499,14 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
     }
     spdlog::info("All threads joined."); // DEBUG LOG
 
-    // (Final log and save logic remains the same)
-     if (last_logged_percent_.load() < 100 && completed_iterations_.load() >= iterations) {
-          spdlog::info("Training progress: 100%");
-     }
-     spdlog::info("Training complete. Total iterations run: {}. Final iteration count: {}. Nodes created: {}", iterations_to_run, completed_iterations_.load(), total_nodes_created_.load());
-     if (!save_filename.empty()) { /* ... final save ... */
+    // --- Final Log & Save ---
+    // Ensure 100% is logged if the loop finished before the last 5% step triggered it
+    if (last_logged_percent_.load() < 100 && completed_iterations_.load() >= iterations) {
+         spdlog::info("Training progress: 100%");
+    }
+    spdlog::info("Training complete. Total iterations run: {}. Final iteration count: {}. Nodes created: {}. Max depth reached: {}",
+                 iterations_to_run, completed_iterations_.load(), total_nodes_created_.load(), max_depth_reached_.load()); // Log max depth
+    if (!save_filename.empty()) { /* ... final save ... */
          spdlog::info("Performing final save to checkpoint file: {}", save_filename);
          std::string temp_filename = save_filename + ".final.tmp";
           if (save_checkpoint(temp_filename)) {

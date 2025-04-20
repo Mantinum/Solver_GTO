@@ -32,11 +32,12 @@ public:
 private:
     NodeMap node_map_; // Stores regrets and strategies for each infoset
     std::mutex node_map_mutex_; // Mutex to protect access to node_map_ and Node data
-    std::atomic<long long> total_nodes_created_{0}; // Track node creation thread-safely
-    std::atomic<int> completed_iterations_{0}; // Track completed iterations thread-safely
-    std::atomic<int> last_logged_percent_{-1}; // Track last logged percentage to avoid spam
+    std::atomic<long long> total_nodes_created_{0};
+    std::atomic<int> completed_iterations_{0};
+    std::atomic<int> last_logged_percent_{-1};
+    std::atomic<int> max_depth_reached_{0}; // Track max recursion depth
 
-    ActionAbstraction action_abstraction_; // To get legal actions
+    ActionAbstraction action_abstraction_;
     HandEvaluator hand_evaluator_;       // To evaluate terminal states
 
     // Recursive CFR+ function - now a private member
@@ -44,9 +45,10 @@ private:
         GameState current_state,
         int traversing_player,
         const std::vector<double>& reach_probabilities,
-        std::vector<Card>& deck, // Pass deck by reference
-        int& card_idx,           // Pass next card index by reference
-        std::mt19937& rng        // Pass RNG for sampling opponent actions
+        std::vector<Card>& deck,
+        int& card_idx,
+        std::mt19937& rng,
+        int depth = 0            // Add depth parameter
     );
 };
 
