@@ -22,6 +22,11 @@
 #include <map>       // For storing strategies
 #include <vector>    // Used extensively
 #include <array>     // For grid structure
+#include <sstream>   // For stringstream
+
+// Assume Big Blind size is needed for calculations
+// TODO: Make this configurable or get from GameState if possible
+const int BIG_BLIND_SIZE = 2;
 
 
 // Helper function to format hand vector to string like "AKs", "T9o", "77"
@@ -52,14 +57,34 @@ std::string format_hand_string(const std::vector<gto_solver::Card>& hand) {
     }
 }
 
-// Function to display the strategy grid
+// Helper function to create action string with amount (used by ActionAbstraction and main)
+std::string create_action_string_local(const std::string& base, double value, const std::string& unit) {
+    std::string val_str;
+    if (std::abs(value - std::round(value)) < 1e-5) {
+        val_str = std::to_string(static_cast<int>(value));
+    } else {
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(1) << value;
+        val_str = ss.str();
+    }
+    return base + "_" + val_str + unit;
+}
+
+
+// Function to display the strategy grid for a specific position
 void display_strategy_grid(
+    const std::string& position_name,
     const std::map<std::string, std::vector<double>>& strategies,
-    const std::vector<std::string>& legal_actions)
+    const std::vector<std::string>& legal_actions) // Pass the CORRECT legal actions for this spot
 {
-    spdlog::info("--- Preflop Strategy Grid (SB vs BB - Simplified View) ---");
+    spdlog::info("--- Preflop Strategy Grid ({}) ---", position_name);
+    // Display legal actions for context
+    std::string actions_str = "";
+    for(const auto& act : legal_actions) actions_str += act + " ";
+    spdlog::info("Legal Actions: {}", actions_str);
+
     std::cout << "   A    K    Q    J    T    9    8    7    6    5    4    3    2" << std::endl;
-    std::cout << "--------------------------------------------------------------------" << std::endl;
+    std::cout << "----------------------------------------------------------------------" << std::endl; // Adjusted width
 
     const std::array<char, 13> ranks = {'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'};
 
@@ -79,39 +104,91 @@ void display_strategy_grid(
 
             if (strategies.count(hand_str)) {
                 const auto& strategy = strategies.at(hand_str);
-                if (!strategy.empty() && strategy.size() == legal_actions.size()) {
-                    double max_prob = -1.0;
-                    size_t max_idx = static_cast<size_t>(-1); // Initialize properly
-                    // Find the index of the action with the highest probability
-                    for(size_t k = 0; k < strategy.size(); ++k) {
-                        if (strategy[k] > max_prob) {
-                            max_prob = strategy[k];
-                            max_idx = k;
+                if (!strategy.empty()) {
+                     // Check if strategy size matches the provided legal actions size
+                     if (strategy.size() == legal_actions.size()) {
+                        double max_prob = -1.0;
+                        size_t max_idx = static_cast<size_t>(-1); // Use static_cast for clarity
+                        for(size_t k = 0; k < strategy.size(); ++k) {
+                            // Only consider non-fold actions for display character if possible
+                            if (legal_actions[k] != "fold" && strategy[k] > max_prob) {
+                                max_prob = strategy[k];
+                                max_idx = k;
+                            }
                         }
-                    }
-
-                    if (max_idx != static_cast<size_t>(-1)) { // Check if max_idx was found
-                        const std::string& action = legal_actions[max_idx];
-                        // Assign character based on the dominant action
-                        if (action == "fold") display_char = 'F';
-                        else if (action == "call") display_char = 'C';
-                        else if (action == "all_in") display_char = 'A';
-                        else if (action.find("raise") != std::string::npos) display_char = 'R';
-                        else display_char = '?'; // Unknown dominant action
+                        // If only fold has probability > 0, max_idx will remain -1
+                        if (max_idx == static_cast<size_t>(-1)) {
+                             // Check if fold is the dominant action
+                             size_t fold_idx = static_cast<size_t>(-1);
+                             for(size_t k=0; k<legal_actions.size(); ++k) { if(legal_actions[k] == "fold") { fold_idx = k; break; } }
+                             if (fold_idx != static_cast<size_t>(-1) && strategy[fold_idx] > 0.5) { // Threshold for displaying fold
+                                  display_char = 'F';
+                             } else {
+                                  // Find the overall max probability action if fold isn't dominant
+                                   max_prob = -1.0; // Reset max_prob
+                                   for(size_t k = 0; k < strategy.size(); ++k) {
+                                       if (strategy[k] > max_prob) {
+                                           max_prob = strategy[k];
+                                           max_idx = k;
+                                       }
+                                   }
+                                   if (max_idx != static_cast<size_t>(-1)) {
+                                        // Fallback to showing the highest prob action even if it's fold
+                                        const std::string& action = legal_actions[max_idx];
+                                        if (action == "fold") display_char = 'F';
+                                        else if (action == "call") display_char = 'C';
+                                        else if (action == "check") display_char = 'K';
+                                        else if (action == "all_in") display_char = 'A';
+                                        else if (action.find("raise") != std::string::npos) display_char = 'R';
+                                        else if (action.find("bet") != std::string::npos) display_char = 'B';
+                                        else display_char = '?';
+                                   } else {
+                                        display_char = '-'; // Strategy likely empty or all zeros
+                                   }
+                             }
+                        } else {
+                            // We found a non-fold dominant action
+                            const std::string& action = legal_actions[max_idx];
+                            if (action == "call") display_char = 'C'; // Includes Limp for SB
+                            else if (action == "check") display_char = 'K'; // Check for BB
+                            else if (action == "all_in") display_char = 'A';
+                            else if (action.find("raise") != std::string::npos) display_char = 'R';
+                            else if (action.find("bet") != std::string::npos) display_char = 'B'; // Postflop
+                            else display_char = '?';
+                        }
                     } else {
-                         display_char = '-'; // Strategy likely empty or all zeros
+                         spdlog::warn("Strategy size ({}) mismatch for hand {} vs legal actions size ({}) for {}",
+                                       strategy.size(), hand_str, legal_actions.size(), position_name);
+                         spdlog::warn("Strategy size ({}) mismatch for hand {} vs expected legal actions size ({}) for {}. Displaying based on raw strategy.",
+                                       strategy.size(), hand_str, legal_actions.size(), position_name);
+                         // Attempt to display dominant action based on raw strategy size if possible
+                         double max_prob_raw = -1.0;
+                         size_t max_idx_raw = static_cast<size_t>(-1);
+                         for(size_t k = 0; k < strategy.size(); ++k) {
+                             if (strategy[k] > max_prob_raw) {
+                                 max_prob_raw = strategy[k];
+                                 max_idx_raw = k;
+                             }
+                         }
+                         // Cannot reliably map max_idx_raw to action name, use generic '?' or '-'
+                         if (max_idx_raw != static_cast<size_t>(-1)) {
+                              display_char = '?'; // Indicate mismatch but show dominant action exists
+                         } else {
+                              display_char = '-'; // No dominant action found in raw strategy
+                         }
                     }
-                } else if (!strategy.empty()) {
-                     display_char = 'E'; // Size mismatch error
+                } else {
+                     // Strategy is empty, node likely not visited often enough
+                     display_char = '.';
                 }
             }
             // Use setw for alignment, print the character
-            std::cout << std::setw(4) << std::left << display_char << " "; // Added space for better separation
+            std::cout << std::setw(4) << std::left << display_char << " "; // Added space
         }
         std::cout << std::endl;
     }
-     std::cout << "--------------------------------------------------------------------" << std::endl;
-     std::cout << "Legend: R=Raise(any), C=Call, F=Fold, A=All-in, .=NotFound, E=Error, -=No Action" << std::endl;
+     std::cout << "----------------------------------------------------------------------" << std::endl;
+     std::cout << "Legend: R=Raise, C=Call/Limp, F=Fold, K=Check, A=All-in, .=NotFound, E=SizeError(DEPRECATED), X=IndexError, ?=MismatchDominant, -=No Action" << std::endl << std::endl;
 }
 
 
@@ -121,46 +198,19 @@ void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-i" || arg == "--iterations") && i + 1 < argc) {
-            try {
-                iterations = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                spdlog::warn("Invalid value for iterations: {}. Using default {}.", argv[i], iterations);
-            }
+            try { iterations = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid iterations value."); }
         } else if ((arg == "-n" || arg == "--num_players") && i + 1 < argc) {
-             try {
-                num_players = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                spdlog::warn("Invalid value for num_players: {}. Using default {}.", argv[i], num_players);
-            }
+             try { num_players = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid num_players value."); }
         } else if ((arg == "-s" || arg == "--stack") && i + 1 < argc) {
-             try {
-                initial_stack = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                spdlog::warn("Invalid value for initial_stack: {}. Using default {}.", argv[i], initial_stack);
-            }
+             try { initial_stack = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid stack value."); }
         } else if ((arg == "-a" || arg == "--ante") && i + 1 < argc) {
-             try {
-                ante_size = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                spdlog::warn("Invalid value for ante_size: {}. Using default {}.", argv[i], ante_size);
-            }
+             try { ante_size = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid ante value."); }
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
-             try {
-                num_threads = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                spdlog::warn("Invalid value for num_threads: {}. Using default (hardware concurrency).", argv[i]);
-                 num_threads = 0; // Use 0 to signify hardware concurrency default in engine
-            }
+             try { num_threads = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid threads value."); num_threads = 0; }
         } else if ((arg == "--save") && i + 1 < argc) {
             save_file = argv[++i];
         } else if ((arg == "--interval") && i + 1 < argc) {
-             try {
-                checkpoint_interval = std::stoi(argv[++i]);
-                if (checkpoint_interval < 0) checkpoint_interval = 0; // Ensure non-negative
-            } catch (const std::exception& e) {
-                spdlog::warn("Invalid value for checkpoint interval: {}. Disabling periodic saves.", argv[i]);
-                checkpoint_interval = 0;
-            }
+             try { checkpoint_interval = std::stoi(argv[++i]); if (checkpoint_interval < 0) checkpoint_interval = 0; } catch (...) { spdlog::warn("Invalid interval value."); checkpoint_interval = 0; }
         } else if ((arg == "--load") && i + 1 < argc) {
             load_file = argv[++i];
         }
@@ -174,7 +224,7 @@ void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& 
 int main(int argc, char* argv[]) { // Modified main signature
     // --- Default Parameters ---
     int num_iterations = 10000;
-    int num_players = 2; // Default to HU
+    int num_players = 6; // Default to 6-max now
     int initial_stack = 100; // Default to 100BB
     int ante_size = 0; // Default to no ante
     int num_threads = 0; // Default to 0 (engine will use hardware_concurrency)
@@ -185,16 +235,12 @@ int main(int argc, char* argv[]) { // Modified main signature
     // --- Setup Logging ---
     try {
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        console_sink->set_level(spdlog::level::info); // Log info and above
-        // Example pattern: [%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v
-        // console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
-
+        console_sink->set_level(spdlog::level::info);
         spdlog::logger logger("gto_solver_logger", {console_sink});
-        logger.set_level(spdlog::level::info); // Set logger level
-        // Flush automatically on info level logs and above
+        logger.set_level(spdlog::level::info);
         logger.flush_on(spdlog::level::info);
         spdlog::set_default_logger(std::make_shared<spdlog::logger>(logger));
-        spdlog::info("Logging initialized."); // This should now definitely flush
+        spdlog::info("Logging initialized.");
 
     } catch (const spdlog::spdlog_ex& ex) {
         std::cerr << "Log initialization failed: " << ex.what() << std::endl;
@@ -214,86 +260,99 @@ int main(int argc, char* argv[]) { // Modified main signature
     try {
         // --- Initialization ---
         spdlog::info("Initializing modules...");
-        // Create instances needed outside the engine (if any)
-        gto_solver::ActionAbstraction action_abstraction;
-        gto_solver::HandGenerator hand_generator; // Instantiate HandGenerator
-        // Create the main engine instance
+        gto_solver::ActionAbstraction action_abstraction; // Keep instance for get_action_amount
+        gto_solver::HandGenerator hand_generator;
         gto_solver::CFREngine cfr_engine;
-
         spdlog::info("Modules initialized.");
 
         // --- Training ---
         spdlog::info("Starting training for target {} iterations...", num_iterations);
-        // Call train with all parsed parameters
         cfr_engine.train(num_iterations, num_players, initial_stack, ante_size, num_threads, save_file, checkpoint_interval, load_file);
-        // Note: "Training finished." log is now inside cfr_engine.train
 
         // --- Strategy Extraction and Display ---
         spdlog::info("--- Strategy Extraction ---");
 
-        if (num_players == 2) { // Focus on HU SB (Player 0) for now
-            int target_player = 0;
-            int button_pos = 0; // Assuming SB is P0, BB is P1, BTN is P0
-            spdlog::info("Extracting strategy for Player {} (SB) Preflop", target_player);
+        // Define positions for 6-max (assuming BTN=0)
+        std::map<std::string, int> position_map;
+        if (num_players == 6) {
+            position_map = {{"UTG", 3}, {"MP", 4}, {"CO", 5}, {"BTN", 0}, {"SB", 1}}; // BB=2 cannot RFI
+        } else if (num_players == 2) {
+             position_map = {{"SB", 0}}; // Only SB can RFI in HU
+        } else {
+             spdlog::warn("RFI extraction only implemented for 6-max and HU.");
+             return 0; // Exit if not 6-max or HU
+        }
 
-            // Create the initial state to get legal actions for this specific spot
-            gto_solver::GameState initial_state(num_players, initial_stack, ante_size, button_pos);
-            // Ensure the state reflects the SB's turn to act initially
-            if (initial_state.get_current_player() != target_player) {
-                 spdlog::error("Initial state logic error: Expected player {} to act first. Actual: {}", target_player, initial_state.get_current_player());
-                 // Depending on GameState logic, this might need adjustment or indicate an error
-                 // For now, we proceed assuming the actions are correct for the initial SB decision.
+
+        auto all_hands_str = hand_generator.generate_hands();
+
+        // Store strategies per position
+        std::map<std::string, std::map<std::string, std::vector<double>>> position_strategies;
+
+        for (const auto& pos_pair : position_map) {
+            const std::string& pos_name = pos_pair.first;
+            int player_index = pos_pair.second;
+
+            spdlog::info("Extracting RFI strategy for {} (Player {})", pos_name, player_index);
+
+            // --- Determine Correct Legal Actions for RFI in this context ---
+            // Manually construct the expected actions based on ActionAbstraction logic for RFI
+            std::vector<std::string> rfi_legal_actions;
+            rfi_legal_actions.push_back("fold"); // Always possible
+
+            // Calculate the specific RFI raise size based on stack depth
+            double open_size_bb = 2.3; // Default for >= 40bb
+            if (initial_stack < 25 * BIG_BLIND_SIZE) open_size_bb = 2.0;
+            else if (initial_stack < 35 * BIG_BLIND_SIZE) open_size_bb = 2.1;
+            else if (initial_stack < 40 * BIG_BLIND_SIZE) open_size_bb = 2.2;
+
+            // Special SB sizing & Limp option
+            if (pos_name == "SB") {
+                 open_size_bb = 3.0; // Use 3x for SB open (adjust if needed)
+                 rfi_legal_actions.push_back("call"); // Represent Limp as Call
             }
 
-            std::vector<std::string> legal_actions = action_abstraction.get_possible_actions(initial_state);
-            spdlog::info("Legal actions for SB: {}", fmt::join(legal_actions, ", "));
+            std::string raise_action_str = create_action_string_local("raise", open_size_bb, "bb");
+            rfi_legal_actions.push_back(raise_action_str);
 
-            // Generate all starting hands (1326 combos initially, will be grouped later)
-            auto all_hands_str = hand_generator.generate_hands(); // Returns vector<string> like "AsKc"
+            // Check if All-in is a distinct and valid action
+            // Create a temporary state just to calculate all-in amount and check validity
+            // Note: This temp state doesn't perfectly reflect the RFI context, but is used for amount calculation
+            gto_solver::GameState temp_state(num_players, initial_stack, ante_size, 0); // BTN=0 assumed
+            int player_stack_val = temp_state.get_player_stacks()[player_index];
+            int all_in_total_amount = player_stack_val; // All-in commits the whole stack
+            int raise_total_amount = action_abstraction.get_action_amount(raise_action_str, temp_state);
 
-            spdlog::info("Strategy Profile (Hand: Action=Probability%):");
-            // Use std::cout for potentially long output, format percentages
-            // std::cout << std::fixed << std::setprecision(1); // 1 decimal place for percentage // Moved to grid display
-
-            // Use a map to store strategies for the 169 canonical hand types
-            std::map<std::string, std::vector<double>> canonical_strategies;
-            std::map<std::string, int> canonical_counts; // To average strategies if needed (though CFR should converge)
-
-            for (const std::string& hand_str_internal : all_hands_str) { // e.g., "AsKc"
-                 if (hand_str_internal.length() != 4) {
-                     spdlog::warn("Skipping invalid hand string from generator: {}", hand_str_internal);
-                     continue;
+            if (all_in_total_amount > raise_total_amount) {
+                 int current_bet = temp_state.get_bet_this_round(player_index); // Should be 0 or blind
+                 int amount_to_call = temp_state.get_amount_to_call(player_index); // Should be 0 or blind diff
+                 int min_legal_total_bet = current_bet + amount_to_call + std::max(1, temp_state.get_last_raise_size());
+                 if (all_in_total_amount >= min_legal_total_bet) {
+                      rfi_legal_actions.push_back("all_in");
                  }
-                // Convert "AsKc" to {"As", "Kc"} vector for InfoSet and formatting
-                std::vector<gto_solver::Card> hand_vec = {hand_str_internal.substr(0, 2), hand_str_internal.substr(2, 2)};
+            }
+            // --- End Determining Legal Actions ---
 
-                // Ensure hand is sorted alphabetically for canonical InfoSet key
+
+            std::map<std::string, std::vector<double>> current_pos_strategies;
+            for (const std::string& hand_str_internal : all_hands_str) {
+                 if (hand_str_internal.length() != 4) continue;
+                std::vector<gto_solver::Card> hand_vec = {hand_str_internal.substr(0, 2), hand_str_internal.substr(2, 2)};
                 std::vector<gto_solver::Card> sorted_hand_for_key = hand_vec;
                 std::sort(sorted_hand_for_key.begin(), sorted_hand_for_key.end());
 
-                std::string history = ""; // Initial preflop node
+                std::string history = ""; // RFI history is empty
                 gto_solver::InfoSet infoset(sorted_hand_for_key, history);
-                std::string infoset_key = infoset.get_key(); // e.g., "AcKs|"
+                std::string infoset_key = infoset.get_key(player_index); // Use player index in key
 
                 std::vector<double> strategy = cfr_engine.get_strategy(infoset_key);
-
-                // Format hand string for display (e.g., "AKs", "T9o", "77")
-                std::string canonical_hand_str = format_hand_string(hand_vec); // Use the helper
-
-                // Store the strategy for the canonical hand type
-                // If multiple specific hands map to the same canonical type (e.g. AcKc, AdKd -> AKs),
-                // the last one encountered will overwrite previous ones. This is generally fine
-                // as the strategy should converge to be the same for equivalent hands.
-                // If averaging is desired, uncomment the count logic.
-                canonical_strategies[canonical_hand_str] = strategy;
-                // canonical_counts[canonical_hand_str]++; // Optional: for averaging later if needed
+                std::string canonical_hand_str = format_hand_string(hand_vec);
+                current_pos_strategies[canonical_hand_str] = strategy;
             }
+            position_strategies[pos_name] = current_pos_strategies;
 
-            // Display the strategy grid
-            display_strategy_grid(canonical_strategies, legal_actions);
-
-        } else {
-            spdlog::warn("Strategy grid display currently only implemented for Heads-Up (num_players=2).");
+            // Display grid for this position using the CORRECT legal actions
+            display_strategy_grid(pos_name, current_pos_strategies, rfi_legal_actions);
         }
 
 
