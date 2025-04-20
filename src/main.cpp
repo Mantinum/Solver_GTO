@@ -155,12 +155,13 @@ void display_strategy_grid(
                             else if (action.find("raise") != std::string::npos) display_char = 'R';
                             else if (action.find("bet") != std::string::npos) display_char = 'B'; // Postflop
                             else display_char = '?';
-                        }
+                         }
                     } else {
-                         spdlog::warn("Strategy size ({}) mismatch for hand {} vs legal actions size ({}) for {}",
-                                       strategy.size(), hand_str, legal_actions.size(), position_name);
-                         spdlog::warn("Strategy size ({}) mismatch for hand {} vs expected legal actions size ({}) for {}. Displaying based on raw strategy.",
-                                       strategy.size(), hand_str, legal_actions.size(), position_name);
+                         // Commented out warning logs to reduce noise
+                         // spdlog::warn("Strategy size ({}) mismatch for hand {} vs legal actions size ({}) for {}",
+                         //              strategy.size(), hand_str, legal_actions.size(), position_name);
+                         // spdlog::warn("Strategy size ({}) mismatch for hand {} vs expected legal actions size ({}) for {}. Displaying based on raw strategy.",
+                         //              strategy.size(), hand_str, legal_actions.size(), position_name);
                          // Attempt to display dominant action based on raw strategy size if possible
                          double max_prob_raw = -1.0;
                          size_t max_idx_raw = static_cast<size_t>(-1);

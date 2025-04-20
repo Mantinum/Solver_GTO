@@ -1,12 +1,12 @@
-# Roadmap du Développement du Solver GTO
+Raise first in# Roadmap du Développement du Solver GTO
 
 Ce document décrit les étapes de développement prévues pour le solver GTO de poker.
 
 ## Phase 1 : Recherche, Conception et Architecture de Base (Terminée)
 
-*   [x] Évaluation de la faisabilité et des algorithmes (CFR+ choisi pour commencer).
-*   [x] Choix des technologies (C++20, CMake, GoogleTest).
-*   [x] Définition de l'architecture modulaire (hand\_generator, hand\_evaluator, action\_abstraction, cfr\_engine, monte\_carlo).
+*   [x] Évaluation de la faisabilité et des algorithmes (CFR+ initialement, puis MCCFR).
+*   [x] Choix des technologies (C++17/20, CMake, GoogleTest). // C++17 pour std::filesystem
+*   [x] Définition de l'architecture modulaire (hand\_generator, hand\_evaluator, action\_abstraction, cfr\_engine). // monte_carlo non utilisé pour l'instant
 *   [x] Création de la structure de base du projet (répertoires, CMakeLists.txt).
 *   [x] Création des fichiers squelettes pour chaque module (.h et .cpp).
 *   [x] Implémentation de base et tests unitaires pour `hand_generator`.
@@ -14,38 +14,44 @@ Ce document décrit les étapes de développement prévues pour le solver GTO de
 *   [x] Implémentation de base (placeholder) et tests unitaires pour `action_abstraction`.
 *   [x] Définition des structures de données (`GameState`, `InfoSet`, `Node`).
 *   [x] Mise en place de la structure de la classe `CFREngine` avec ses dépendances.
-*   [x] Mise en place de `main.cpp` pour initialiser et lancer l'entraînement (basique).
+*   [x] Mise en place de `main.cpp` pour initialiser et lancer l'entraînement (paramétrable).
 *   [x] Compilation et exécution réussies du squelette.
 
-## Phase 2 : Prototype Fonctionnel Préflop (En cours)
+## Phase 2 : Prototype Fonctionnel Préflop (Terminée - Base MCCFR)
 
-*   **Objectif :** Obtenir un solver capable d'exécuter des itérations CFR+ sur un scénario préflop simple (ex: Heads-Up), d'extraire la stratégie résultante et d'utiliser le multithreading pour l'entraînement.
+*   **Objectif :** Obtenir un solver capable d'exécuter des itérations **MCCFR** sur des scénarios préflop (HU, 6-max), d'extraire la stratégie résultante, d'utiliser le multithreading et le checkpointing.
 
 *   **Étapes Clés Réalisées :**
-    *   [x] **Implémenter `GameState::apply_action` :** Logique de base implémentée. Logique de fin de tour améliorée (utilise `player_acted_this_sequence_` pour multi-way). `update_next_player` saute les joueurs inactifs. `advance_to_next_street` détermine le premier joueur postflop via bouton.
-    *   [x] **Implémenter le calcul des payoffs dans `CFREngine::cfr_plus_recursive` :** Cas du fold géré. Logique de base pour showdown multi-way et gestion des pots annexes implémentée.
-    *   [x] **Gérer la distribution des mains initiales :** Fait dans `CFREngine::train`.
-    *   [x] **Convertir les actions (string) en `Action` struct dans `CFREngine::cfr_plus_recursive` :** Fait.
-    *   [x] **Implémenter `ActionAbstraction::get_possible_actions` de manière dynamique :** Logique de base implémentée. Ajout tailles de mise postflop (% pot). Ajout tailles d'open raise préflop (2.2bb, 2.5bb, 3bb). Ajout relances préflop (2.2x, 2.5x, 3x). Ajout relances postflop (pot, 2.0x, 2.5x). Calcul min-raise amélioré. Filtrage actions redondantes. Logique de relance `_Nx` gère les 4-bet+.
-    *   [x] **Gestion des blinds et antes :** Logique ajoutée dans `GameState` et paramétrable via `main.cpp`.
-    *   [x] **Améliorer `HandEvaluator` :** Interface modifiée (`evaluate_preflop_hand`, `evaluate_7_card_hand`). Implémentation `evaluate_preflop_hand` améliorée. `evaluate_7_card_hand` utilise `PokerHandEvaluator`.
-    *   [x] **Implémenter `MonteCarlo::estimate_equity` (basique) :** Simulation contre main aléatoire implémentée.
-    *   [x] **Ajouter des tests unitaires pour `cfr_engine` et `GameState` :** Tests ajoutés pour `GameState`. Tests ajoutés pour `CFREngine` (smoke test, regret matching, StrategySumToOne).
-    *   [x] **Intégrer le Logging (`spdlog`) :** Fait.
-    *   [x] **Améliorer la logique de fin de tour/street** dans `GameState` (utilisation état interne).
-    *   [x] **Améliorer le calcul des tailles de raise/bet** dans `ActionAbstraction`.
-    *   [x] **Implémenter l'extraction de stratégie préflop** dans `main.cpp`.
-    *   [x] **Implémenter le multithreading** dans `CFREngine::train` pour accélérer l'entraînement.
-    *   [x] **Validation :** Exécution multithread réussie. Stratégie préflop extraite (non convergente avec peu d'itérations, mais le mécanisme fonctionne).
+    *   [x] **Implémenter `GameState` :** Logique HU et multi-way de base, gestion des blinds/antes, fin de tour/street.
+    *   [x] **Implémenter `HandEvaluator` :** Utilisation de `phevaluator`.
+    *   [x] **Implémenter `ActionAbstraction` :** Abstraction contextuelle (RFI, vs Limp, vs Raise, Postflop) avec plusieurs sizings (version "enrichie" actuelle).
+    *   [x] **Implémenter `CFREngine` (initialement CFR+) :** Calcul des payoffs multi-way/pots annexes (ChipEV).
+    *   [x] **Intégrer Logging (`spdlog`) et Tests Unitaires (`gtest`) de base.**
+    *   [x] **Implémenter Multithreading** dans `CFREngine::train`.
+    *   [x] **Implémenter Checkpointing Binaire** (sauvegarde/chargement de `NodeMap`).
+    *   [x] **Implémenter l'Extraction de Stratégie RFI Multi-Positions** dans `main.cpp` (avec affichage grille).
+    *   [x] **Refactoriser `CFREngine` pour utiliser MCCFR (External Sampling)** pour résoudre les problèmes de mémoire en 6-max.
+    *   [x] **Validation :** Exécution MCCFR multithread réussie en local (HU et 6-max) pour un faible nombre d'itérations. La profondeur d'arbre augmente avec les itérations.
 
-*   **TODOs / Améliorations Possibles pour cette Phase :**
-    *   [ ] **Validation Multi-way Approfondie :** Ajouter des tests spécifiques pour les scénarios multi-way complexes et les pots annexes.
-    *   [ ] **Affiner/Ajouter Tailles de Mise :** Revoir les tailles de mise dans `ActionAbstraction` si nécessaire pour plus de réalisme ou de granularité.
-    *   [ ] **Mesure de Convergence/Exploitabilité :** Implémenter une métrique (ex: calcul d'exploitabilité) pour évaluer la qualité de la stratégie GTO après un entraînement long.
-    *   [ ] **Améliorer l'Affichage des Ranges :** Formater la sortie de `main.cpp` en grille de range ou exporter en CSV/JSON.
-    *   [ ] **Étendre `MonteCarlo::estimate_equity` :** Gérer les ranges d'équité au lieu d'une seule main aléatoire (utile pour certaines variantes de CFR ou analyses post-calcul).
+*   **Problèmes Connus / TODOs Immédiats :**
+    *   [ ] **Vitesse MCCFR 6-max :** Bien que fonctionnel, la vitesse (~1000 it/s localement) pourrait être améliorée ou indiquer une exploration encore limitée. Nécessite un entraînement long pour évaluer la convergence réelle.
+    *   [ ] **Affichage '?' (Mismatch) :** L'affichage de la grille RFI montre des '?' car les nœuds peuvent être créés via des chemins non-RFI avec un nombre d'actions différent. Solution idéale : stocker les actions avec le nœud.
+    *   [ ] **Validation Fonctionnelle Approfondie :** Ajouter des tests unitaires spécifiques pour MCCFR, le checkpointing, et les scénarios multi-way complexes.
+    *   [ ] **Mesure de Convergence/Exploitabilité :** Essentiel pour valider la qualité des solutions GTO après un entraînement long.
 
-## Phase 3 : Adaptation pour MTT et Enrichissement (Future)
+## Phase 3 : Améliorations et Préparation Déploiement (En cours)
+*   **Objectif :** Obtenir des solutions préflop ChipEV fiables et exploitables, prêtes pour une utilisation intensive.
+*   **Étapes :**
+    *   [ ] **Entraînement Long (AWS) :** Lancer des entraînements 6-max et HU avec des millions/milliards d'itérations sur AWS en utilisant MCCFR et le checkpointing.
+    *   [ ] **Analyse de Convergence :** Utiliser les métriques d'exploitabilité (à implémenter) pour déterminer quand arrêter l'entraînement.
+    *   [ ] **Affiner l'Abstraction d'Action :** Basé sur l'analyse des premières solutions longues, ajuster/ajouter/supprimer des sizings dans `ActionAbstraction` pour améliorer le réalisme et la performance. Itérer entraînement/analyse.
+    *   [ ] **Optimiser la Vitesse (si nécessaire) :** Si la vitesse sur AWS reste un frein majeur, envisager `std::unordered_map` pour `NodeMap` ou d'autres optimisations C++.
+    *   [ ] **Améliorer l'Extraction/Visualisation :**
+        *   [ ] Résoudre le problème des '?' (stocker actions dans Node ou autre méthode).
+        *   [ ] Permettre l'extraction d'autres spots (vs Limp, 3Bet, 4Bet, défense BB/SB...).
+        *   [ ] Exporter les ranges en format standard (JSON, CSV).
+
+## Phase 4 : Adaptation pour MTT (Future)
 
 *   [ ] **Intégration ICM (Independent Chip Model) :** Modifier le calcul des payoffs dans `CFREngine` pour utiliser l'équité du tournoi ($ICM) au lieu des jetons bruts. C'est l'étape **fondamentale** pour les MTT. Nécessite une fonction d'évaluation ICM.
 *   [ ] **Gestion des Stacks Variables :** Adapter `GameState` et potentiellement `InfoSet` pour prendre en compte les tailles de tapis effectives variables (ou résoudre pour des profondeurs spécifiques).
