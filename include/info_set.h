@@ -19,7 +19,8 @@ public:
     const std::string& get_action_history() const;
 
     // Generate a unique string key for this infoset (useful for map keys)
-    std::string get_key() const;
+    // Now includes player index to distinguish strategies per position
+    std::string get_key(int player_index) const;
 
     // Equality operator for map comparisons
     bool operator==(const InfoSet& other) const;
@@ -27,9 +28,10 @@ public:
 private:
     std::vector<Card> private_hand_;
     std::string action_history_; // String representation of public actions
-    std::string key_; // Cached key
+    mutable std::string key_; // Cached key (mutable to allow generation in const get_key)
 
-    void generate_key();
+    // Generate key now takes player index
+    void generate_key(int player_index) const;
 };
 
 // Hash function for InfoSet to allow usage in std::unordered_map
