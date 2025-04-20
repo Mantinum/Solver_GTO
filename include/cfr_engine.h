@@ -12,6 +12,7 @@
 #include <atomic> // For std::atomic
 #include <fstream> // For std::ofstream, std::ifstream
 #include <string> // Ensure string is included
+#include <random> // For std::mt19937
 
 namespace gto_solver {
 
@@ -44,7 +45,8 @@ private:
         int traversing_player,
         const std::vector<double>& reach_probabilities,
         std::vector<Card>& deck, // Pass deck by reference
-        int& card_idx           // Pass next card index by reference
+        int& card_idx,           // Pass next card index by reference
+        std::mt19937& rng        // Pass RNG for sampling opponent actions
     );
 };
 
