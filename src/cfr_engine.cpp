@@ -25,6 +25,7 @@
 #include <memory>    // For std::unique_ptr, std::make_unique
 
 #include "spdlog/spdlog.h" // Include spdlog
+#include "spdlog/fmt/bundled/format.h" // Include fmt for logging vectors
 
 // Define a simple version number for the BINARY checkpoint format
 const uint32_t CHECKPOINT_VERSION_BIN = 2;
@@ -83,16 +84,15 @@ double CFREngine::cfr_plus_recursive(
     int depth // Added depth parameter
 ) {
     // --- Update Max Depth Reached ---
-    // Use fetch_max for atomic update if current depth is greater
     int current_max_depth = max_depth_reached_.load(std::memory_order_relaxed);
     if (depth > current_max_depth) {
-        max_depth_reached_.compare_exchange_strong(current_max_depth, depth); // Attempt atomic update
+        max_depth_reached_.compare_exchange_strong(current_max_depth, depth, std::memory_order_relaxed);
     }
 
     // --- 1. Check for Terminal State ---
      Street entry_street = current_state.get_current_street();
     if (current_state.is_terminal()) {
-        // spdlog::trace("Depth {}: Terminal state reached.", depth); // DEBUG LOG
+        // spdlog::trace("Depth {}: Terminal state reached.", depth); // DEBUG LOG COMMENTED
         // ... (payoff calculation logic is unchanged) ...
         double final_payoff = 0.0;
         int num_players = current_state.get_num_players();
@@ -160,6 +160,7 @@ double CFREngine::cfr_plus_recursive(
              spdlog::error("Terminal state reached with 0 showdown players. History: {}", current_state.get_history_string());
              final_payoff = -contributions[traversing_player];
         }
+        // spdlog::trace("Depth {}: Terminal Payoff for player {}: {:.2f}", depth, traversing_player, final_payoff); // DEBUG LOG COMMENTED
         return final_payoff;
     }
 
@@ -186,12 +187,12 @@ double CFREngine::cfr_plus_recursive(
         std::lock_guard<std::mutex> lock(node_map_mutex_);
         auto it = node_map_.find(info_set_key);
         if (it == node_map_.end()) {
-            // spdlog::trace("Depth {}: Creating node: {}", depth, info_set_key); // DEBUG LOG
+            // spdlog::trace("Depth {}: Creating node: {}", depth, info_set_key); // DEBUG LOG COMMENTED
             auto emplace_result = node_map_.emplace(info_set_key, std::make_unique<Node>(num_actions));
             node_ptr = emplace_result.first->second.get();
             total_nodes_created_++;
         } else {
-            // spdlog::trace("Depth {}: Found node: {}", depth, info_set_key); // DEBUG LOG
+            // spdlog::trace("Depth {}: Found node: {}", depth, info_set_key); // DEBUG LOG COMMENTED
             node_ptr = it->second.get();
         }
     }
@@ -218,18 +219,21 @@ double CFREngine::cfr_plus_recursive(
         size_t sampled_action_idx = 0;
         if (!current_strategy.empty()) {
              bool all_zero = true;
-             for(double p : current_strategy) { if (p > 0) { all_zero = false; break; } }
+             for(double p : current_strategy) { if (p > 1e-9) { all_zero = false; break; } }
              if (all_zero) {
                   std::uniform_int_distribution<size_t> uniform_dist(0, current_strategy.size() - 1);
                   sampled_action_idx = uniform_dist(rng);
+                  // spdlog::trace("Depth {}: Opponent {} strategy all zero/negative, sampling uniformly: action {}", depth, current_player, sampled_action_idx); // DEBUG LOG COMMENTED
              } else {
                   try {
                        std::discrete_distribution<size_t> dist(current_strategy.begin(), current_strategy.end());
                        sampled_action_idx = dist(rng);
+                       // spdlog::trace("Depth {}: Opponent {} sampled action index: {} ({}) from strategy [{}]", depth, current_player, sampled_action_idx, legal_actions_str[sampled_action_idx], fmt::join(current_strategy, ", ")); // DEBUG LOG COMMENTED
                   } catch (const std::exception& e) {
                        spdlog::error("Error creating discrete_distribution for node {}: {}. Strategy: [{}]", info_set_key, e.what(), fmt::join(current_strategy, ", "));
                        std::uniform_int_distribution<size_t> uniform_dist(0, current_strategy.size() - 1);
                        sampled_action_idx = uniform_dist(rng);
+                       // spdlog::trace("Depth {}: Opponent {} distribution error, sampling uniformly: action {}", depth, current_player, sampled_action_idx); // DEBUG LOG COMMENTED
                   }
              }
         } else {
@@ -238,7 +242,6 @@ double CFREngine::cfr_plus_recursive(
         }
 
         const std::string& action_str = legal_actions_str[sampled_action_idx];
-        // spdlog::trace("Depth {}: Player {} sampled action: {}", depth, current_player, action_str); // DEBUG LOG
         Action action;
         action.player_index = current_player;
         // (Action parsing logic...)
@@ -258,7 +261,7 @@ double CFREngine::cfr_plus_recursive(
         Street next_street = next_state.get_current_street();
         int current_card_idx = card_idx;
         if (next_street != entry_street && next_street != Street::SHOWDOWN) {
-             // spdlog::trace("Depth {}: Dealing cards for {}", depth, static_cast<int>(next_street)); // DEBUG LOG
+             // spdlog::trace("Depth {}: Dealing cards for {}", depth, static_cast<int>(next_street)); // DEBUG LOG COMMENTED
              std::vector<Card> cards_to_deal;
             int num_cards_to_deal = 0;
             if (next_street == Street::FLOP && entry_street == Street::PREFLOP) num_cards_to_deal = 3;
@@ -306,7 +309,7 @@ double CFREngine::cfr_plus_recursive(
              Street next_street = next_state.get_current_street();
              int current_card_idx = card_idx;
              if (next_street != entry_street && next_street != Street::SHOWDOWN) {
-                 // spdlog::trace("Depth {}: Dealing cards for {}", depth, static_cast<int>(next_street)); // DEBUG LOG
+                 // spdlog::trace("Depth {}: Dealing cards for {}", depth, static_cast<int>(next_street)); // DEBUG LOG COMMENTED
                  std::vector<Card> cards_to_deal;
                  int num_cards_to_deal = 0;
                  if (next_street == Street::FLOP && entry_street == Street::PREFLOP) num_cards_to_deal = 3;
@@ -358,6 +361,7 @@ double CFREngine::cfr_plus_recursive(
         node_ptr->visit_count++; // Atomic increment
     }
 
+    // spdlog::trace("Depth {}: Returning utility {:.2f} for player {}", depth, node_utility, traversing_player); // DEBUG LOG COMMENTED
     return node_utility;
 }
 
@@ -366,7 +370,7 @@ double CFREngine::cfr_plus_recursive(
 
 // Train function needs to pass down RNG for opponent sampling
 void CFREngine::train(int iterations, int num_players, int initial_stack, int ante_size, int num_threads, const std::string& save_filename, int checkpoint_interval, const std::string& load_filename) {
-    spdlog::info("Entering train function..."); // DEBUG LOG
+    // spdlog::info("Entering train function..."); // DEBUG LOG COMMENTED
 
     // --- Load Checkpoint if specified ---
     int starting_iteration = 0;
@@ -399,11 +403,11 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
     const std::vector<char> ranks = {'2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'};
     const std::vector<char> suits = {'c', 'd', 'h', 's'};
     for (char r : ranks) { for (char s : suits) { master_deck.push_back(std::string(1, r) + s); } }
-    spdlog::info("Master deck initialized."); // DEBUG LOG
+    // spdlog::info("Master deck initialized."); // DEBUG LOG COMMENTED
 
     // --- Thread Worker Function (Needs RNG) ---
     auto worker_task = [&](int thread_id, int iterations_for_thread) {
-        spdlog::info("[Thread {}] Starting worker task for {} iterations.", thread_id, iterations_for_thread); // DEBUG LOG
+        // spdlog::info("[Thread {}] Starting worker task for {} iterations.", thread_id, iterations_for_thread); // DEBUG LOG COMMENTED
         unsigned seed = std::chrono::system_clock::now().time_since_epoch().count() + thread_id + starting_iteration;
         std::mt19937 rng(seed); // Thread-local RNG
         std::vector<Card> deck = master_deck;
@@ -473,11 +477,11 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
                   }
              }
         } // End iteration loop
-        spdlog::info("[Thread {}] Worker task finished.", thread_id); // DEBUG LOG
+        // spdlog::info("[Thread {}] Worker task finished.", thread_id); // DEBUG LOG COMMENTED
     }; // End lambda worker_task
 
     // --- Launch Threads ---
-    spdlog::info("Launching threads..."); // DEBUG LOG
+    // spdlog::info("Launching threads..."); // DEBUG LOG COMMENTED
     std::vector<std::thread> threads;
     int iterations_per_thread = iterations_to_run / threads_to_use;
     int remaining_iterations = iterations_to_run % threads_to_use;
@@ -485,11 +489,11 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
     for (unsigned int i = 0; i < threads_to_use; ++i) {
         int iters = iterations_per_thread + (i < remaining_iterations ? 1 : 0);
         if (iters > 0) {
-            spdlog::info("Launching thread {} for {} iterations.", i, iters); // DEBUG LOG
+            // spdlog::info("Launching thread {} for {} iterations.", i, iters); // DEBUG LOG COMMENTED
             threads.emplace_back(worker_task, i, iters);
         }
     }
-    spdlog::info("All threads launched. Joining..."); // DEBUG LOG
+    // spdlog::info("All threads launched. Joining..."); // DEBUG LOG COMMENTED
 
     // --- Join Threads ---
     for (auto& t : threads) {
@@ -497,7 +501,7 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
             t.join();
         }
     }
-    spdlog::info("All threads joined."); // DEBUG LOG
+    // spdlog::info("All threads joined."); // DEBUG LOG COMMENTED
 
     // --- Final Log & Save ---
     // Ensure 100% is logged if the loop finished before the last 5% step triggered it
