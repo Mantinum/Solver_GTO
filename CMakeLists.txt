@@ -55,7 +55,7 @@ add_executable(gto_solver
 )
 # Link gto_solver against spdlog, phevaluator, and nlohmann_json
 target_link_libraries(gto_solver PRIVATE spdlog::spdlog pheval nlohmann_json::nlohmann_json)
-# Explicitly add phevaluator include directory
+# Explicitly add include directories for dependencies
 target_include_directories(gto_solver PRIVATE
     ${phevaluator_SOURCE_DIR}/cpp/include
     ${nlohmann_json_SOURCE_DIR}/include # Add include dir for nlohmann/json

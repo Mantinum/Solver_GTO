@@ -24,6 +24,10 @@
 #include <vector>    // Used extensively
 #include <array>     // For grid structure
 #include <sstream>   // For stringstream
+#include <fstream>   // For std::ofstream (JSON export)
+
+#include <nlohmann/json.hpp> // Include JSON library
+using json = nlohmann::json;
 
 // Assume Big Blind size is needed for calculations
 const int BIG_BLIND_SIZE = 2; // TODO: Make configurable
@@ -52,7 +56,7 @@ std::string create_action_string_local(const std::string& base, double value, co
 
 
 // Function to display the strategy grid for a specific position
-// Now takes the map of StrategyInfo objects
+// Takes the map of StrategyInfo objects for the specific position
 void display_strategy_grid(
     const std::string& position_name,
     const std::map<std::string, gto_solver::StrategyInfo>& position_strategy_info)
@@ -132,10 +136,60 @@ void display_strategy_grid(
      std::cout << "Legend: R=Raise, C=Call/Limp, F=Fold, K=Check, A=All-in, .=NotFound, E=SizeError, ?=UnknownAction, -=No Action" << std::endl << std::endl;
 }
 
+// Function to export strategies to JSON
+void export_strategies_to_json(
+    const std::string& filename,
+    const std::map<std::string, std::map<std::string, gto_solver::StrategyInfo>>& position_strategy_infos)
+{
+    json output_json;
+
+    spdlog::info("Exporting strategies to JSON file: {}", filename);
+
+    for (const auto& pos_pair : position_strategy_infos) {
+        const std::string& pos_name = pos_pair.first;
+        const auto& strategy_map = pos_pair.second;
+        json pos_json; // JSON object for this position
+
+        for (const auto& hand_pair : strategy_map) {
+            const std::string& canonical_hand = hand_pair.first;
+            const auto& info = hand_pair.second;
+
+            if (info.found && !info.strategy.empty() && !info.actions.empty()) {
+                json hand_json; // JSON object for this hand
+                hand_json["actions"] = info.actions;
+                // Format strategy probabilities nicely (e.g., 4 decimal places)
+                json strat_array = json::array();
+                for(double prob : info.strategy) {
+                     // Round to avoid excessive precision
+                     strat_array.push_back(std::round(prob * 10000.0) / 10000.0);
+                }
+                hand_json["strategy"] = strat_array;
+                pos_json[canonical_hand] = hand_json;
+            }
+            // Optionally include hands not found or with errors? For now, skip them.
+        }
+        output_json[pos_name] = pos_json; // Add position object to main JSON
+    }
+
+    // Write JSON to file
+    try {
+        std::ofstream ofs(filename);
+        if (!ofs) {
+            spdlog::error("Failed to open JSON file for writing: {}", filename);
+            return;
+        }
+        ofs << std::setw(2) << output_json << std::endl; // Pretty print with 2 spaces indent
+        ofs.close();
+        spdlog::info("Strategies successfully exported to {}", filename);
+    } catch (const std::exception& e) {
+        spdlog::error("Failed to write JSON file {}: {}", filename, e.what());
+    }
+}
+
 
 // Function to parse command line arguments (simple version)
 // Added checkpoint parameters
-void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& initial_stack, int& ante_size, int& num_threads, std::string& save_file, int& checkpoint_interval, std::string& load_file) {
+void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& initial_stack, int& ante_size, int& num_threads, std::string& save_file, int& checkpoint_interval, std::string& load_file, std::string& json_export_file) { // Added json export file
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-i" || arg == "--iterations") && i + 1 < argc) {
@@ -154,6 +208,8 @@ void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& 
              try { checkpoint_interval = std::stoi(argv[++i]); if (checkpoint_interval < 0) checkpoint_interval = 0; } catch (...) { spdlog::warn("Invalid interval value."); checkpoint_interval = 0; }
         } else if ((arg == "--load") && i + 1 < argc) {
             load_file = argv[++i];
+        } else if ((arg == "--json") && i + 1 < argc) { // Added JSON export argument
+            json_export_file = argv[++i];
         }
          else {
             spdlog::warn("Unknown or incomplete argument: {}", arg);
@@ -172,6 +228,7 @@ int main(int argc, char* argv[]) { // Modified main signature
     std::string save_file = ""; // Default: no saving
     int checkpoint_interval = 0; // Default: no periodic saving (only final if save_file specified)
     std::string load_file = ""; // Default: no loading
+    std::string json_export_file = ""; // Default: no JSON export
 
     // --- Setup Logging ---
     try {
@@ -191,17 +248,17 @@ int main(int argc, char* argv[]) { // Modified main signature
     spdlog::info("Starting GTO Solver");
 
     // --- Parse Arguments ---
-    parse_args(argc, argv, num_iterations, num_players, initial_stack, ante_size, num_threads, save_file, checkpoint_interval, load_file);
+    parse_args(argc, argv, num_iterations, num_players, initial_stack, ante_size, num_threads, save_file, checkpoint_interval, load_file, json_export_file); // Pass json_export_file
     spdlog::info("Configuration - Iterations: {}, Players: {}, Stack: {}, Ante: {}, Threads: {}",
                  num_iterations, num_players, initial_stack, ante_size, (num_threads <= 0 ? "Auto" : std::to_string(num_threads)));
     if (!load_file.empty()) spdlog::info("Load Checkpoint: {}", load_file);
     if (!save_file.empty()) spdlog::info("Save Checkpoint: {}, Interval: {} iters (0=final only)", save_file, checkpoint_interval);
+    if (!json_export_file.empty()) spdlog::info("JSON Export File: {}", json_export_file); // Log JSON export file
 
 
     try {
         // --- Initialization ---
         spdlog::info("Initializing modules...");
-        // ActionAbstraction is now mostly internal to CFREngine
         gto_solver::HandGenerator hand_generator;
         gto_solver::CFREngine cfr_engine;
         spdlog::info("Modules initialized.");
@@ -250,14 +307,17 @@ int main(int argc, char* argv[]) { // Modified main signature
                 gto_solver::StrategyInfo strat_info = cfr_engine.get_strategy_info(infoset_key);
 
                 std::string canonical_hand_str = format_hand_string(hand_vec);
-                // Store the info for the canonical hand type
-                // Overwrites if multiple combos map here, which is fine for display
                 current_pos_strategy_info[canonical_hand_str] = strat_info;
             }
             position_strategy_infos[pos_name] = current_pos_strategy_info;
 
             // Display grid for this position using the collected StrategyInfo map
-            display_strategy_grid(pos_name, current_pos_strategy_info); // Pass map instead of NodeMap ref
+            display_strategy_grid(pos_name, current_pos_strategy_info);
+        }
+
+        // --- Export to JSON if filename provided ---
+        if (!json_export_file.empty()) {
+            export_strategies_to_json(json_export_file, position_strategy_infos);
         }
 
 
