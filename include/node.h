@@ -8,9 +8,11 @@
 #include <memory> // For std::unique_ptr
 #include <atomic>
 #include <mutex>  // Include mutex
+#include <string> // For std::string
+#include <vector> // For std::vector
 
-#include <nlohmann/json.hpp>
-using json = nlohmann::json;
+// #include <nlohmann/json.hpp> // JSON removed as serialization is manual
+// using json = nlohmann::json;
 
 
 namespace gto_solver {
@@ -30,10 +32,17 @@ struct Node {
     // Mutable allows locking even in const methods if needed (like get_average_strategy)
     mutable std::mutex node_mutex;
 
-    // Constructor to initialize vectors based on the number of actions
-    Node(size_t num_actions) : regret_sum(num_actions, 0.0), strategy_sum(num_actions, 0.0) {}
+    // Store the legal actions available at this node when it was created
+    std::vector<std::string> legal_actions;
 
-    // Node is non-copyable and non-movable due to the mutex member.
+    // Constructor now takes legal actions to store them
+    Node(const std::vector<std::string>& actions)
+        : regret_sum(actions.size(), 0.0),
+          strategy_sum(actions.size(), 0.0),
+          legal_actions(actions) // Copy the actions
+    {}
+
+    // Node is non-copyable and non-movable due to the mutex member and potentially large vectors.
 
     // Get the current average strategy based on the accumulated strategy sum.
     // IMPORTANT: Caller must ensure node_mutex is locked before calling this in a multithreaded context.
@@ -63,8 +72,7 @@ struct Node {
 using NodeMap = std::map<std::string, std::unique_ptr<Node>>;
 // Consider: using NodeMap = std::unordered_map<std::string, std::unique_ptr<Node>>;
 
-// Note: Global to_json/from_json for Node are removed as serialization
-// will be handled manually in CFREngine due to pointer ownership and locking.
+// Note: Global to_json/from_json for Node are removed
 
 } // namespace gto_solver
 

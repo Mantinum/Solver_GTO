@@ -18,12 +18,21 @@ namespace gto_solver {
 
 class GameState; // Forward declaration
 
+// Structure to hold strategy info for display/export
+struct StrategyInfo {
+    bool found = false;
+    std::vector<double> strategy;
+    std::vector<std::string> actions;
+};
+
+
 class CFREngine {
 public:
     CFREngine();
     // Modified train signature to accept game parameters and number of threads
     void train(int iterations, int num_players, int initial_stack, int ante_size = 0, int num_threads = 1, const std::string& save_filename = "", int checkpoint_interval = 0, const std::string& load_filename = "");
-    std::vector<double> get_strategy(const std::string& info_set_key);
+    // std::vector<double> get_strategy(const std::string& info_set_key); // Deprecated, use get_strategy_info
+    StrategyInfo get_strategy_info(const std::string& info_set_key) const; // New function
 
     // Checkpointing methods
     bool save_checkpoint(const std::string& filename) const;

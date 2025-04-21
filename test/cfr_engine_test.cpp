@@ -99,12 +99,14 @@ TEST(CFREngineTest, StrategySumToOne) {
     // Example: Player 0 (SB) holds AcKs (sorted), history is empty
     // Note: The exact hand dealt depends on shuffling, so this specific key
     // might not be hit in every test run with only 100 iterations.
-    std::string test_key = "AcKs|"; // Assuming AcKs is the canonical representation
+    // Note: The key format might need adjustment based on the final InfoSet::get_key implementation
+    std::string test_key = "0:AcKs|"; // Example key for Player 0 with AcKs, empty history
 
-    std::vector<double> strategy = engine.get_strategy(test_key);
+    gto_solver::StrategyInfo strat_info = engine.get_strategy_info(test_key);
 
     // Only perform sum check if a strategy was found for this specific node
-    if (!strategy.empty()) {
+    if (strat_info.found && !strat_info.strategy.empty()) {
+        const auto& strategy = strat_info.strategy; // Use the strategy from the struct
         double sum = std::accumulate(strategy.begin(), strategy.end(), 0.0);
         EXPECT_NEAR(sum, 1.0, 1e-6) << "Strategy probabilities for InfoSet " << test_key << " do not sum to 1.0. Sum: " << sum;
     } else {
@@ -115,6 +117,7 @@ TEST(CFREngineTest, StrategySumToOne) {
         SUCCEED();
     }
 }
+// Removed duplicated/old code block below
 
 
 } // namespace gto_solver
