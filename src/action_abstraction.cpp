@@ -104,10 +104,10 @@ std::vector<std::string> ActionAbstraction::get_possible_actions(const GameState
                       actions_set.insert(create_action_string("raise", 3.0, "x")); // Smaller 3bet
                       actions_set.insert(create_action_string("raise", 4.0, "x")); // Larger 3bet
                  } else if (num_raises == 2) { // Facing a 3bet -> 4Bet or Call
-                      actions_set.insert(create_action_string("raise", 2.2, "x")); // Smaller 4bet sizing
-                      // Add a larger 4bet sizing? Maybe just all-in for simplicity still.
+                      actions_set.insert(create_action_string("raise", 2.5, "x")); // Standard 4bet sizing (e.g., 2.5x the 3bet)
                  }
-                 // For 4bet+ situations, or as a general option vs any raise:
+                 // For 3bet+ situations (num_raises >= 2), always consider All-in
+                 // Also consider All-in vs open raise if stack is short? Added below.
                  actions_set.insert("all_in");
             }
              // Always consider All-in preflop if affordable and not already covered
