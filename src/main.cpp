@@ -90,19 +90,24 @@ void display_strategy_grid(
                     double max_prob = -1.0;
                     size_t max_idx = static_cast<size_t>(-1);
                     for(size_t k = 0; k < strategy.size(); ++k) {
+                        // Find the action with highest probability, excluding fold if possible
                         if (node_legal_actions[k] != "fold" && strategy[k] > max_prob) {
                             max_prob = strategy[k];
                             max_idx = k;
                         }
                     }
+                    // If only fold has probability > 0, or all probabilities are tiny/zero
                     if (max_idx == static_cast<size_t>(-1)) {
                          size_t fold_idx = static_cast<size_t>(-1);
                          for(size_t k=0; k<node_legal_actions.size(); ++k) { if(node_legal_actions[k] == "fold") { fold_idx = k; break; } }
-                         if (fold_idx != static_cast<size_t>(-1) && strategy[fold_idx] > 0.5) {
+
+                         if (fold_idx != static_cast<size_t>(-1) && strategy[fold_idx] > 0.5) { // If fold is clearly dominant
                               display_char = 'F';
                          } else {
-                               max_prob = -1.0;
+                               // Fallback: Find the absolute max probability action, even if it's fold or tiny
+                               max_prob = -1.0; // Reset max_prob
                                for(size_t k = 0; k < strategy.size(); ++k) { if (strategy[k] > max_prob) { max_prob = strategy[k]; max_idx = k; } }
+
                                if (max_idx != static_cast<size_t>(-1)) {
                                     const std::string& action = node_legal_actions[max_idx];
                                     if (action == "fold") display_char = 'F';
@@ -111,20 +116,24 @@ void display_strategy_grid(
                                     else if (action == "all_in") display_char = 'A';
                                     else if (action.find("raise") != std::string::npos) display_char = 'R';
                                     else if (action.find("bet") != std::string::npos) display_char = 'B';
-                                    else display_char = '?';
-                               } else { display_char = '-'; }
+                                    else display_char = '?'; // Unknown action format
+                               } else { display_char = '-'; } // Strategy likely empty or all zeros
                          }
                     } else {
+                        // We found a non-fold dominant action
                         const std::string& action = node_legal_actions[max_idx];
                         if (action == "call") display_char = 'C';
                         else if (action == "check") display_char = 'K';
                         else if (action == "all_in") display_char = 'A';
                         else if (action.find("raise") != std::string::npos) display_char = 'R';
                         else if (action.find("bet") != std::string::npos) display_char = 'B';
-                        else display_char = '?';
+                        else display_char = '?'; // Unknown action format
                     }
                 } else if (info.found && !info.strategy.empty()) {
-                     display_char = 'E'; // Size mismatch error (shouldn't happen now)
+                     // This case indicates a mismatch between strategy size and actions size stored in the node
+                     // Should not happen if node creation and loading is correct
+                     display_char = 'E'; // Error
+                     spdlog::warn("Strategy/Action size mismatch in node for hand {}", hand_str_display);
                 }
                  // If info.found is false, display_char remains '.'
             }
