@@ -74,44 +74,51 @@ std::vector<std::string> ActionAbstraction::get_possible_actions(const GameState
             int sb_index = (current_state.get_button_position() + 1) % current_state.get_num_players();
             if (current_state.get_num_players() == 2) sb_index = current_state.get_button_position();
 
-            if (!facing_bet_or_raise && num_limpers == 0) { // RFI or SB complete/raise vs BB check
-                 if (current_player == sb_index) { // SB RFI (includes HU)
+            // Case 1: RFI (Raise First In) or SB action vs BB check
+            if (!facing_bet_or_raise && num_limpers == 0) {
+                 if (current_player == sb_index) { // SB action (RFI or Complete vs BB check)
                       actions_set.insert("call"); // Limp/Complete
-                      actions_set.insert(create_action_string("raise", 3.0, "bb")); // Standard SB open size
-                      actions_set.insert(create_action_string("raise", 4.0, "bb")); // Larger SB open size
-                 } else if (current_state.is_first_to_act_preflop(current_player)) { // RFI from other positions
-                      // Depth-dependent RFI sizing + alternatives
-                      double open_size_bb_small = 2.2; // Adjusted default small size
+                      actions_set.insert(create_action_string("raise", 3.0, "bb"));
+                      actions_set.insert(create_action_string("raise", 4.0, "bb"));
+                 } else if (current_state.is_first_to_act_preflop(current_player)) { // RFI from UTG, MP, CO, BTN
+                      double open_size_bb_small = 2.2;
                       if (effective_stack < 25 * BIG_BLIND_SIZE) open_size_bb_small = 2.0;
                       else if (effective_stack < 35 * BIG_BLIND_SIZE) open_size_bb_small = 2.1;
-
                       actions_set.insert(create_action_string("raise", open_size_bb_small, "bb"));
-                      actions_set.insert(create_action_string("raise", 2.5, "bb")); // Mid size
-                      actions_set.insert(create_action_string("raise", 3.0, "bb")); // Larger size
+                      actions_set.insert(create_action_string("raise", 2.5, "bb"));
+                      actions_set.insert(create_action_string("raise", 3.0, "bb"));
                  }
-                 // BB check option is handled by adding "check" earlier
+                 // Note: BB check option already added if amount_to_call == 0
             }
-            else if (!facing_bet_or_raise && num_limpers > 0) { // Facing limper(s) -> Iso-raise or Overlimp
-                 actions_set.insert("call"); // Option to overlimp
+            // Case 2: Facing Limper(s)
+            else if (!facing_bet_or_raise && num_limpers > 0) {
+                 actions_set.insert("call"); // Overlimp
                  double iso_size_bb1 = 3.0 + num_limpers;
                  double iso_size_bb2 = 4.0 + num_limpers;
                  actions_set.insert(create_action_string("raise", iso_size_bb1, "bb"));
                  actions_set.insert(create_action_string("raise", iso_size_bb2, "bb"));
             }
-            else if (facing_bet_or_raise) { // Facing a raise (2bet, 3bet, 4bet...)
-                 if (num_raises == 1) { // Facing an open raise -> 3Bet or Call
-                      // Simplified 3bet sizings (average IP/OOP)
-                      actions_set.insert(create_action_string("raise", 3.0, "x")); // Smaller 3bet
-                      actions_set.insert(create_action_string("raise", 4.0, "x")); // Larger 3bet
-                 } else if (num_raises == 2) { // Facing a 3bet -> 4Bet or Call
-                      actions_set.insert(create_action_string("raise", 2.5, "x")); // Standard 4bet sizing (e.g., 2.5x the 3bet)
+            // Case 3: Facing a Raise
+            else if (facing_bet_or_raise) {
+                 if (num_raises == 1) { // Facing RFI (a 2Bet) -> Options are Call, 3Bet, Fold
+                      // TODO: Add IP vs OOP logic here
+                      actions_set.insert(create_action_string("raise", 3.0, "x")); // 3Bet sizing 1
+                      actions_set.insert(create_action_string("raise", 4.0, "x")); // 3Bet sizing 2
+                 } else if (num_raises == 2) { // Facing a 3Bet -> Options are Call, 4Bet, Fold
+                      actions_set.insert(create_action_string("raise", 2.5, "x")); // 4Bet sizing
                  }
-                 // For 3bet+ situations (num_raises >= 2), always consider All-in
-                 // Also consider All-in vs open raise if stack is short? Added below.
+                 // For num_raises >= 2 (facing 3bet or more), All-in is always an option
+                 if (num_raises >= 2) {
+                      actions_set.insert("all_in");
+                 }
+                 // Also consider All-in vs the initial RFI (num_raises == 1) if stacks are short?
+                 // Let's add it always for now, filtering will remove if identical to another raise.
                  actions_set.insert("all_in");
             }
-             // Always consider All-in preflop if affordable and not already covered
-             actions_set.insert("all_in");
+            // Add All-in as a general option if not already added by specific logic
+            // This needs careful filtering later to avoid redundancy.
+            // Let's rely on the final filtering step instead of adding it unconditionally here.
+            // actions_set.insert("all_in"); // REMOVED from here
         }
         // --- Postflop Abstraction ---
         else {
