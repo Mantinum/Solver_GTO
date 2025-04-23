@@ -6,47 +6,48 @@
 #include <vector>
 #include <functional> // For std::hash
 
+#include "game_state.h" // Include full GameState definition here now
+
 namespace gto_solver {
 
 // Represents the information available to a player at a decision point.
 // Used as a key to store regrets and strategies.
 class InfoSet {
 public:
-    InfoSet(const std::vector<Card>& private_hand, const std::string& action_history);
+    // Constructor for use during CFR traversal (uses current state)
+    InfoSet(const GameState& current_state, int player_index);
+
+    // Constructor for use during extraction (specify hand and history)
+    InfoSet(const std::vector<Card>& private_hand, const std::string& action_history, const GameState& state_for_context, int player_index);
 
     // Getters
-    const std::vector<Card>& get_private_hand() const;
-    const std::string& get_action_history() const;
+    // const std::vector<Card>& get_private_hand() const; // Can be derived from key if needed
+    // const std::string& get_action_history() const; // Can be derived from key if needed
 
     // Generate a unique string key for this infoset (useful for map keys)
-    // Now includes player index to distinguish strategies per position
-    std::string get_key(int player_index) const;
+    const std::string& get_key() const; // Key is now generated at construction
 
-    // Equality operator for map comparisons
+    // Equality operator for map comparisons (compares keys)
     bool operator==(const InfoSet& other) const;
 
 private:
-    std::vector<Card> private_hand_;
-    std::string action_history_; // String representation of public actions
-    mutable std::string key_; // Cached key (mutable to allow generation in const get_key)
+    // Store necessary components directly or generate key immediately
+    // std::vector<Card> private_hand_; // No longer stored directly
+    // std::string action_history_; // No longer stored directly
+    std::string key_; // Key generated at construction and stored
 
-    // Generate key now takes player index
-    void generate_key(int player_index) const;
+    // Key generation logic moved to constructor or a helper called by it
+    // void generate_key(const GameState& current_state, int player_index); // Made private or part of constructor
 };
 
 // Hash function for InfoSet to allow usage in std::unordered_map
 struct InfoSetHash {
     std::size_t operator()(const InfoSet& info_set) const {
-        // Combine hashes of hand and history
-        std::size_t h1 = 0;
-        // Simple hash for hand (consider a better one for performance)
-        for(const auto& card : info_set.get_private_hand()) {
-             h1 ^= std::hash<std::string>{}(card) + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
-        }
-        std::size_t h2 = std::hash<std::string>{}(info_set.get_action_history());
-        return h1 ^ (h2 << 1); // Combine hashes
+        // Hash the generated key directly
+        return std::hash<std::string>{}(info_set.get_key());
     }
 };
+
 
 } // namespace gto_solver
 

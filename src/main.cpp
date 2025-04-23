@@ -295,6 +295,9 @@ int main(int argc, char* argv[]) { // Modified main signature
         // Store strategies per position using StrategyInfo
         std::map<std::string, std::map<std::string, gto_solver::StrategyInfo>> position_strategy_infos;
 
+        // Create the base initial state once for context (street, board)
+        gto_solver::GameState initial_state_context(num_players, initial_stack, ante_size, 0); // BTN=0 is arbitrary for context
+
         for (const auto& pos_pair : position_map) {
             const std::string& pos_name = pos_pair.first;
             int player_index = pos_pair.second;
@@ -308,9 +311,11 @@ int main(int argc, char* argv[]) { // Modified main signature
                 std::vector<gto_solver::Card> sorted_hand_for_key = hand_vec;
                 std::sort(sorted_hand_for_key.begin(), sorted_hand_for_key.end());
 
+                // Use the new InfoSet constructor for extraction:
+                // Pass the specific hand, empty history for RFI, the initial state for context (street=PREFLOP, board=empty), and the player index.
                 std::string history = ""; // RFI history is empty
-                gto_solver::InfoSet infoset(sorted_hand_for_key, history);
-                std::string infoset_key = infoset.get_key(player_index);
+                gto_solver::InfoSet infoset(sorted_hand_for_key, history, initial_state_context, player_index);
+                const std::string& infoset_key = infoset.get_key();
 
                 // Use the new function to get strategy and actions
                 gto_solver::StrategyInfo strat_info = cfr_engine.get_strategy_info(infoset_key);
@@ -321,7 +326,7 @@ int main(int argc, char* argv[]) { // Modified main signature
             position_strategy_infos[pos_name] = current_pos_strategy_info;
 
             // Display grid for this position using the collected StrategyInfo map
-            display_strategy_grid(pos_name, current_pos_strategy_info);
+            display_strategy_grid(pos_name, current_pos_strategy_info); // DECOMMENTED
         }
 
         // --- Export to JSON if filename provided ---
