@@ -10,9 +10,7 @@
 #include <mutex>  // Include mutex
 #include <string> // For std::string
 #include <vector> // For std::vector
-
-// #include <nlohmann/json.hpp> // JSON removed as serialization is manual
-// using json = nlohmann::json;
+#include "action_abstraction.h" // Include ActionSpec definition
 
 
 namespace gto_solver {
@@ -33,13 +31,21 @@ struct Node {
     mutable std::mutex node_mutex;
 
     // Store the legal actions available at this node when it was created
-    std::vector<std::string> legal_actions;
+    std::vector<ActionSpec> legal_actions; // Changed to store ActionSpec
 
-    // Constructor now takes legal actions to store them
-    Node(const std::vector<std::string>& actions)
+    // Constructor now takes legal actions (as ActionSpec) to store them
+    Node(const std::vector<ActionSpec>& actions)
         : regret_sum(actions.size(), 0.0),
           strategy_sum(actions.size(), 0.0),
-          legal_actions(actions) // Copy the actions
+          legal_actions(actions) // Copy the ActionSpec vector
+    {}
+
+    // Add a constructor that takes size only for checkpoint loading flexibility
+    // This might be needed if we cannot easily parse ActionSpec during load
+    Node(size_t num_actions)
+        : regret_sum(num_actions, 0.0),
+          strategy_sum(num_actions, 0.0)
+          // legal_actions will be empty, needs to be populated after loading if required
     {}
 
     // Node is non-copyable and non-movable due to the mutex member and potentially large vectors.

@@ -53,6 +53,9 @@ public:
     bool has_player_folded(int player_index) const;
     bool is_player_all_in(int player_index) const;
     int get_player_contribution(int player_index) const; // Get total amount contributed by player to the pot
+    const std::vector<int>& get_current_bets() const; // Added getter for current bets vector
+    int get_last_raiser() const; // Added missing getter declaration
+    int get_num_active_players() const; // Added missing getter declaration
 
     // --- Modifiers ---
     void deal_hands(const std::vector<std::vector<Card>>& hands);

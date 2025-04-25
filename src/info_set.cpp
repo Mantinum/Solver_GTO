@@ -21,9 +21,10 @@ InfoSet::InfoSet(const GameState& current_state, int player_index) {
     // 3. Street
     ss << static_cast<int>(current_state.get_current_street()) << "|"; // Add street enum value
 
-    // 4. Community Cards (Board - Sorted, with placeholders)
+    // 4. Community Cards (Board - Size + Sorted, with placeholders)
     std::vector<Card> board = current_state.get_community_cards();
     std::sort(board.begin(), board.end());
+    ss << board.size(); // Add board size prefix
     for (const auto& card : board) { ss << card; }
     // Add placeholders if board is not complete (e.g., flop, turn)
     for (size_t i = board.size(); i < 5; ++i) { ss << "--"; } // Placeholder for missing cards
@@ -51,9 +52,10 @@ InfoSet::InfoSet(const std::vector<Card>& private_hand, const std::string& actio
     // 3. Street - Use from context state
     ss << static_cast<int>(state_for_context.get_current_street()) << "|";
 
-    // 4. Community Cards (Board - Sorted, with placeholders) - Use from context state
+    // 4. Community Cards (Board - Size + Sorted, with placeholders) - Use from context state
     std::vector<Card> board = state_for_context.get_community_cards();
     std::sort(board.begin(), board.end());
+    ss << board.size(); // Add board size prefix
     for (const auto& card : board) { ss << card; }
     for (size_t i = board.size(); i < 5; ++i) { ss << "--"; }
     ss << "|";

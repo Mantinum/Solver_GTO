@@ -47,6 +47,7 @@ std::string format_hand_string(const std::vector<gto_solver::Card>& hand) {
 }
 
 // Helper function to create action string with amount (used by ActionAbstraction and main)
+// This function might become obsolete if we fully switch to ActionSpec internally
 std::string create_action_string_local(const std::string& base, double value, const std::string& unit) {
     std::string val_str;
     if (std::abs(value - std::round(value)) < 1e-5) { val_str = std::to_string(static_cast<int>(value)); }
@@ -83,15 +84,16 @@ void display_strategy_grid(
             auto it = position_strategy_info.find(hand_str_display);
             if (it != position_strategy_info.end()) {
                 const auto& info = it->second;
+                // Use info.actions (which are now strings converted from ActionSpec)
                 if (info.found && !info.strategy.empty() && !info.actions.empty() && info.strategy.size() == info.actions.size()) {
                     const auto& strategy = info.strategy;
-                    const auto& node_legal_actions = info.actions;
+                    const auto& node_legal_actions_str = info.actions; // These are strings now
 
                     double max_prob = -1.0;
                     size_t max_idx = static_cast<size_t>(-1);
                     for(size_t k = 0; k < strategy.size(); ++k) {
                         // Find the action with highest probability, excluding fold if possible
-                        if (node_legal_actions[k] != "fold" && strategy[k] > max_prob) {
+                        if (node_legal_actions_str[k] != "fold" && strategy[k] > max_prob) {
                             max_prob = strategy[k];
                             max_idx = k;
                         }
@@ -99,7 +101,7 @@ void display_strategy_grid(
                     // If only fold has probability > 0, or all probabilities are tiny/zero
                     if (max_idx == static_cast<size_t>(-1)) {
                          size_t fold_idx = static_cast<size_t>(-1);
-                         for(size_t k=0; k<node_legal_actions.size(); ++k) { if(node_legal_actions[k] == "fold") { fold_idx = k; break; } }
+                         for(size_t k=0; k<node_legal_actions_str.size(); ++k) { if(node_legal_actions_str[k] == "fold") { fold_idx = k; break; } }
 
                          if (fold_idx != static_cast<size_t>(-1) && strategy[fold_idx] > 0.5) { // If fold is clearly dominant
                               display_char = 'F';
@@ -109,7 +111,7 @@ void display_strategy_grid(
                                for(size_t k = 0; k < strategy.size(); ++k) { if (strategy[k] > max_prob) { max_prob = strategy[k]; max_idx = k; } }
 
                                if (max_idx != static_cast<size_t>(-1)) {
-                                    const std::string& action = node_legal_actions[max_idx];
+                                    const std::string& action = node_legal_actions_str[max_idx];
                                     if (action == "fold") display_char = 'F';
                                     else if (action == "call") display_char = 'C';
                                     else if (action == "check") display_char = 'K';
@@ -121,7 +123,7 @@ void display_strategy_grid(
                          }
                     } else {
                         // We found a non-fold dominant action
-                        const std::string& action = node_legal_actions[max_idx];
+                        const std::string& action = node_legal_actions_str[max_idx];
                         if (action == "call") display_char = 'C';
                         else if (action == "check") display_char = 'K';
                         else if (action == "all_in") display_char = 'A';
@@ -130,12 +132,9 @@ void display_strategy_grid(
                         else display_char = '?'; // Unknown action format
                     }
                 } else if (info.found && !info.strategy.empty()) {
-                     // This case indicates a mismatch between strategy size and actions size stored in the node
-                     // Should not happen if node creation and loading is correct
                      display_char = 'E'; // Error
                      spdlog::warn("Strategy/Action size mismatch in node for hand {}", hand_str_display);
                 }
-                 // If info.found is false, display_char remains '.'
             }
             std::cout << std::setw(4) << std::left << display_char << " ";
         }
@@ -165,29 +164,25 @@ void export_strategies_to_json(
 
             if (info.found && !info.strategy.empty() && !info.actions.empty()) {
                 json hand_json; // JSON object for this hand
-                hand_json["actions"] = info.actions;
-                // Format strategy probabilities nicely (e.g., 4 decimal places)
+                hand_json["actions"] = info.actions; // Already strings from get_strategy_info
                 json strat_array = json::array();
                 for(double prob : info.strategy) {
-                     // Round to avoid excessive precision
                      strat_array.push_back(std::round(prob * 10000.0) / 10000.0);
                 }
                 hand_json["strategy"] = strat_array;
                 pos_json[canonical_hand] = hand_json;
             }
-            // Optionally include hands not found or with errors? For now, skip them.
         }
-        output_json[pos_name] = pos_json; // Add position object to main JSON
+        output_json[pos_name] = pos_json;
     }
 
-    // Write JSON to file
     try {
         std::ofstream ofs(filename);
         if (!ofs) {
             spdlog::error("Failed to open JSON file for writing: {}", filename);
             return;
         }
-        ofs << std::setw(2) << output_json << std::endl; // Pretty print with 2 spaces indent
+        ofs << std::setw(2) << output_json << std::endl;
         ofs.close();
         spdlog::info("Strategies successfully exported to {}", filename);
     } catch (const std::exception& e) {
@@ -270,6 +265,7 @@ int main(int argc, char* argv[]) { // Modified main signature
         spdlog::info("Initializing modules...");
         gto_solver::HandGenerator hand_generator;
         gto_solver::CFREngine cfr_engine;
+        // ActionAbstraction is now only needed inside CFREngine
         spdlog::info("Modules initialized.");
 
         // --- Training ---
@@ -312,7 +308,6 @@ int main(int argc, char* argv[]) { // Modified main signature
                 std::sort(sorted_hand_for_key.begin(), sorted_hand_for_key.end());
 
                 // Use the new InfoSet constructor for extraction:
-                // Pass the specific hand, empty history for RFI, the initial state for context (street=PREFLOP, board=empty), and the player index.
                 std::string history = ""; // RFI history is empty
                 gto_solver::InfoSet infoset(sorted_hand_for_key, history, initial_state_context, player_index);
                 const std::string& infoset_key = infoset.get_key();
@@ -326,7 +321,7 @@ int main(int argc, char* argv[]) { // Modified main signature
             position_strategy_infos[pos_name] = current_pos_strategy_info;
 
             // Display grid for this position using the collected StrategyInfo map
-            display_strategy_grid(pos_name, current_pos_strategy_info); // DECOMMENTED
+            display_strategy_grid(pos_name, current_pos_strategy_info);
         }
 
         // --- Export to JSON if filename provided ---

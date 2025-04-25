@@ -28,7 +28,7 @@
 #include "spdlog/fmt/bundled/format.h" // Include fmt for logging vectors
 
 // Define a simple version number for the BINARY checkpoint format
-const uint32_t CHECKPOINT_VERSION_BIN = 3; // Incremented version due to format change
+const uint32_t CHECKPOINT_VERSION_BIN = 4; // Incremented version due to ActionSpec change
 
 namespace gto_solver {
 
@@ -164,15 +164,12 @@ double CFREngine::cfr_plus_recursive(
      if (current_state.get_player_hand(current_player).empty()) {
          return 0.0;
      }
-    // Create InfoSet using the new constructor which takes GameState and player index
-    // The key is generated internally and includes player, hand, street, board, history
     InfoSet info_set(current_state, current_player);
-    // Get the generated key
     const std::string& info_set_key = info_set.get_key();
 
-    // Get legal actions (needed for node creation and iteration)
-    std::vector<std::string> legal_actions_str = action_abstraction_.get_possible_actions(current_state);
-    size_t num_actions = legal_actions_str.size();
+    // Get legal actions using the new spec-based method
+    std::vector<ActionSpec> legal_action_specs = action_abstraction_.get_possible_action_specs(current_state);
+    size_t num_actions = legal_action_specs.size();
 
     if (num_actions == 0) {
          return 0.0;
@@ -184,12 +181,13 @@ double CFREngine::cfr_plus_recursive(
         std::lock_guard<std::mutex> lock(node_map_mutex_); // Lock the map
         auto it = node_map_.find(info_set_key);
         if (it == node_map_.end()) {
-            // Pass the *currently* legal actions to the Node constructor
-            auto emplace_result = node_map_.emplace(info_set_key, std::make_unique<Node>(legal_actions_str));
+            // Pass the vector of ActionSpec to the Node constructor
+            auto emplace_result = node_map_.emplace(info_set_key, std::make_unique<Node>(legal_action_specs));
             node_ptr = emplace_result.first->second.get();
             total_nodes_created_++; // Increment is safe under map lock
         } else {
             node_ptr = it->second.get();
+            // TODO: Check consistency between node_ptr->legal_actions and legal_action_specs?
         }
     } // Map mutex released
 
@@ -198,13 +196,13 @@ double CFREngine::cfr_plus_recursive(
          throw std::runtime_error("Failed to get or create node pointer for key: " + info_set_key);
     }
     // Use the actions stored in the node from now on for consistency
-    const std::vector<std::string>& node_legal_actions = node_ptr->legal_actions;
+    const std::vector<ActionSpec>& node_legal_actions = node_ptr->legal_actions; // Now stores ActionSpec
     size_t node_num_actions = node_legal_actions.size();
     if (node_num_actions == 0) return 0.0;
 
     // --- 3. Calculate Current Strategy (Regret Matching) ---
     std::vector<double> current_regrets;
-    std::vector<double> current_strategy_sum; // Need strategy sum for MCCFR weighting
+    std::vector<double> current_strategy_sum;
     {
         std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
         if (node_ptr->regret_sum.size() != node_num_actions || node_ptr->strategy_sum.size() != node_num_actions) {
@@ -212,7 +210,7 @@ double CFREngine::cfr_plus_recursive(
              throw std::runtime_error("Vector size mismatch for node " + info_set_key);
         }
         current_regrets = node_ptr->regret_sum;
-        current_strategy_sum = node_ptr->strategy_sum; // Copy strategy sum as well
+        current_strategy_sum = node_ptr->strategy_sum;
     }
     std::vector<double> current_strategy = get_strategy_from_regrets(current_regrets);
 
@@ -223,21 +221,21 @@ double CFREngine::cfr_plus_recursive(
     if (current_player != traversing_player) {
         // --- Opponent's Turn: Sample one action ---
         size_t sampled_action_idx = 0;
-        double sampling_prob = 1.0; // Probability of sampling this action
+        double sampling_prob = 1.0;
         if (!current_strategy.empty()) {
              bool all_zero = true;
              double sum_probs = 0.0;
              for(double p : current_strategy) { sum_probs += p; if (p > 1e-9) { all_zero = false; } }
 
-             if (all_zero || std::abs(sum_probs - 1.0) > 1e-6) { // Handle all zero or non-normalized
+             if (all_zero || std::abs(sum_probs - 1.0) > 1e-6) {
                   std::uniform_int_distribution<size_t> uniform_dist(0, current_strategy.size() - 1);
                   sampled_action_idx = uniform_dist(rng);
-                  sampling_prob = (current_strategy.size() > 0) ? (1.0 / current_strategy.size()) : 1.0; // Uniform probability
+                  sampling_prob = (current_strategy.size() > 0) ? (1.0 / current_strategy.size()) : 1.0;
              } else {
                   try {
                        std::discrete_distribution<size_t> dist(current_strategy.begin(), current_strategy.end());
                        sampled_action_idx = dist(rng);
-                       sampling_prob = current_strategy[sampled_action_idx]; // Get the actual probability
+                       sampling_prob = current_strategy[sampled_action_idx];
                   } catch (const std::exception& e) {
                        spdlog::error("Error creating discrete_distribution for node {}: {}. Strategy: [{}]", info_set_key, e.what(), fmt::join(current_strategy, ", "));
                        std::uniform_int_distribution<size_t> uniform_dist(0, current_strategy.size() - 1);
@@ -250,29 +248,25 @@ double CFREngine::cfr_plus_recursive(
              return 0.0;
         }
 
-        // Importance Weight (Inverse of Sampling Probability)
         double importance_weight = (sampling_prob > 1e-9) ? (1.0 / sampling_prob) : 0.0;
+        importance_weight = std::min(importance_weight, 100.0); // Clamp weight
         if (importance_weight == 0.0) {
-             // spdlog::warn("Sampled action index {} for node {} has zero probability. Skipping update.", sampled_action_idx, info_set_key);
-             return 0.0; // Avoid division by zero and invalid updates
+             return 0.0;
         }
 
+        const ActionSpec& action_spec = node_legal_actions[sampled_action_idx]; // Use ActionSpec
+        Action game_action;
+        game_action.player_index = current_player;
+        game_action.type = static_cast<Action::Type>(action_spec.type);
+        game_action.amount = action_abstraction_.get_action_amount(action_spec, current_state);
 
-        const std::string& action_str = node_legal_actions[sampled_action_idx];
-        Action action;
-        action.player_index = current_player;
-        // (Action parsing logic...)
-        if (action_str == "fold") { action.type = Action::Type::FOLD; }
-        else if (action_str == "call") { action.type = Action::Type::CALL; }
-        else if (action_str == "check") { action.type = Action::Type::CHECK; action.amount = 0; }
-        else if (action_str.find("raise") != std::string::npos || action_str.find("bet") != std::string::npos || action_str == "all_in") {
-             action.type = (current_state.get_amount_to_call(current_player) == 0) ? Action::Type::BET : Action::Type::RAISE;
-             action.amount = action_abstraction_.get_action_amount(action_str, current_state);
-             if (action.amount == -1) return 0.0;
-        } else { throw std::logic_error("Unsupported action string: " + action_str); }
+        if (game_action.amount == -1 && action_spec.type != ActionType::FOLD && action_spec.type != ActionType::CHECK && action_spec.type != ActionType::CALL) {
+             spdlog::warn("Could not calculate amount for sampled action spec: {} for node {}", action_spec.to_string(), info_set_key);
+             return 0.0;
+        }
 
         GameState next_state = current_state;
-        try { next_state.apply_action(action); } catch (...) { return 0.0; }
+        try { next_state.apply_action(game_action); } catch (...) { return 0.0; }
 
         // (Community card dealing logic...)
         Street next_street = next_state.get_current_street();
@@ -292,35 +286,30 @@ double CFREngine::cfr_plus_recursive(
         }
 
         std::vector<double> next_reach_probabilities = reach_probabilities;
-        // Update reach probability using the actual strategy probability, not the sampling prob
         if (sampled_action_idx < current_strategy.size()) {
              next_reach_probabilities[current_player] *= current_strategy[sampled_action_idx];
-        } else { return 0.0; } // Should not happen
+        } else { return 0.0; }
 
-
-        // Recursive call for the sampled action, passing RNG and incremented depth
-        // The returned utility needs to be weighted by the importance weight
         node_utility = -cfr_plus_recursive(next_state, traversing_player, next_reach_probabilities, deck, card_idx, rng, depth + 1) * importance_weight;
         card_idx = current_card_idx;
 
     } else {
         // --- Traversing Player's Turn: Explore all actions ---
         for (size_t i = 0; i < node_num_actions; ++i) {
-            Action action;
-            const std::string& action_str = node_legal_actions[i];
-            action.player_index = current_player;
-            // (Action parsing logic...)
-             if (action_str == "fold") { action.type = Action::Type::FOLD; }
-             else if (action_str == "call") { action.type = Action::Type::CALL; }
-             else if (action_str == "check") { action.type = Action::Type::CHECK; action.amount = 0; }
-             else if (action_str.find("raise") != std::string::npos || action_str.find("bet") != std::string::npos || action_str == "all_in") {
-                  action.type = (current_state.get_amount_to_call(current_player) == 0) ? Action::Type::BET : Action::Type::RAISE;
-                  action.amount = action_abstraction_.get_action_amount(action_str, current_state);
-                  if (action.amount == -1) { continue; }
-             } else { throw std::logic_error("Unsupported action string: " + action_str); }
+            const ActionSpec& action_spec = node_legal_actions[i]; // Use ActionSpec
+            Action game_action;
+            game_action.player_index = current_player;
+            game_action.type = static_cast<Action::Type>(action_spec.type);
+            game_action.amount = action_abstraction_.get_action_amount(action_spec, current_state);
+
+            if (game_action.amount == -1 && action_spec.type != ActionType::FOLD && action_spec.type != ActionType::CHECK && action_spec.type != ActionType::CALL) {
+                 spdlog::warn("Could not calculate amount for action spec: {} for node {}", action_spec.to_string(), info_set_key);
+                 action_utilities[i] = -1e18;
+                 continue;
+            }
 
             GameState next_state = current_state;
-             try { next_state.apply_action(action); } catch (...) { continue; }
+             try { next_state.apply_action(game_action); } catch (...) { action_utilities[i] = -1e18; continue; }
 
             // (Community card dealing logic...)
              Street next_street = next_state.get_current_street();
@@ -335,11 +324,10 @@ double CFREngine::cfr_plus_recursive(
                      if (card_idx + num_cards_to_deal <= deck.size()) {
                          for(int k=0; k<num_cards_to_deal; ++k) cards_to_deal.push_back(deck[card_idx++]);
                          next_state.deal_community_cards(cards_to_deal);
-                     } else { card_idx = current_card_idx; continue; }
+                     } else { card_idx = current_card_idx; action_utilities[i] = -1e18; continue; }
                  }
              }
 
-            // Pass RNG down, increment depth
             action_utilities[i] = -cfr_plus_recursive(next_state, traversing_player, reach_probabilities, deck, card_idx, rng, depth + 1);
             card_idx = current_card_idx;
             node_utility += current_strategy[i] * action_utilities[i];
@@ -353,7 +341,6 @@ double CFREngine::cfr_plus_recursive(
             }
         }
 
-        // Lock the specific node's mutex to update its sums
         {
             std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex);
             if (node_ptr->regret_sum.size() != node_num_actions || node_ptr->strategy_sum.size() != node_num_actions) {
@@ -489,7 +476,7 @@ void CFREngine::train(int iterations, int num_players, int initial_stack, int an
 }
 
 // --- Checkpointing Methods ---
-// (save_checkpoint and load_checkpoint need update for Node::legal_actions)
+// Updated for ActionSpec
 bool CFREngine::save_checkpoint(const std::string& filename) const {
     std::lock_guard<std::mutex> map_lock(const_cast<std::mutex&>(node_map_mutex_));
     std::ofstream ofs(filename, std::ios::binary | std::ios::trunc);
@@ -514,13 +501,17 @@ bool CFREngine::save_checkpoint(const std::string& filename) const {
             ofs.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len)); if (!ofs) return false;
             ofs.write(key.c_str(), key_len); if (!ofs) return false;
 
-            // Write legal actions
+            // Write legal actions (ActionSpec)
             size_t actions_count = node_ptr->legal_actions.size();
             ofs.write(reinterpret_cast<const char*>(&actions_count), sizeof(actions_count)); if (!ofs) return false;
-            for(const auto& action_str : node_ptr->legal_actions) {
-                 size_t action_len = action_str.length();
-                 ofs.write(reinterpret_cast<const char*>(&action_len), sizeof(action_len)); if (!ofs) return false;
-                 ofs.write(action_str.c_str(), action_len); if (!ofs) return false;
+            for(const auto& action_spec : node_ptr->legal_actions) {
+                 // Serialize ActionSpec: type, value, unit
+                 ActionType type = action_spec.type;
+                 double value = action_spec.value;
+                 SizingUnit unit = action_spec.unit;
+                 ofs.write(reinterpret_cast<const char*>(&type), sizeof(type)); if (!ofs) return false;
+                 ofs.write(reinterpret_cast<const char*>(&value), sizeof(value)); if (!ofs) return false;
+                 ofs.write(reinterpret_cast<const char*>(&unit), sizeof(unit)); if (!ofs) return false;
             }
 
             // Write regret_sum
@@ -568,17 +559,17 @@ int CFREngine::load_checkpoint(const std::string& filename) {
             std::string key(key_len, '\0');
             ifs.read(&key[0], key_len); if (!ifs) { spdlog::error("Failed reading key data at entry {}", i); ifs.close(); return -1; }
 
-            // Read legal actions
+            // Read legal actions (ActionSpec)
             size_t actions_count;
             ifs.read(reinterpret_cast<char*>(&actions_count), sizeof(actions_count)); if (!ifs) { spdlog::error("Failed reading actions count for key '{}'", key); ifs.close(); return -1; }
-            std::vector<std::string> legal_actions;
+            std::vector<ActionSpec> legal_actions;
             legal_actions.reserve(actions_count);
             for(size_t j=0; j<actions_count; ++j) {
-                 size_t action_len;
-                 ifs.read(reinterpret_cast<char*>(&action_len), sizeof(action_len)); if (!ifs) { spdlog::error("Failed reading action length for key '{}', action {}", key, j); ifs.close(); return -1; }
-                 std::string action_str(action_len, '\0');
-                 ifs.read(&action_str[0], action_len); if (!ifs) { spdlog::error("Failed reading action data for key '{}', action {}", key, j); ifs.close(); return -1; }
-                 legal_actions.push_back(action_str);
+                 ActionSpec spec;
+                 ifs.read(reinterpret_cast<char*>(&spec.type), sizeof(spec.type)); if (!ifs) { spdlog::error("Failed reading action type for key '{}', action {}", key, j); ifs.close(); return -1; }
+                 ifs.read(reinterpret_cast<char*>(&spec.value), sizeof(spec.value)); if (!ifs) { spdlog::error("Failed reading action value for key '{}', action {}", key, j); ifs.close(); return -1; }
+                 ifs.read(reinterpret_cast<char*>(&spec.unit), sizeof(spec.unit)); if (!ifs) { spdlog::error("Failed reading action unit for key '{}', action {}", key, j); ifs.close(); return -1; }
+                 legal_actions.push_back(spec);
             }
 
             // Create Node using loaded actions
@@ -626,7 +617,11 @@ StrategyInfo CFREngine::get_strategy_info(const std::string& info_set_key) const
             std::lock_guard<std::mutex> node_lock(node_ptr->node_mutex); // Lock node for reading
             result.found = true;
             result.strategy = node_ptr->get_average_strategy();
-            result.actions = node_ptr->legal_actions; // Copy stored actions
+            // Convert ActionSpec back to string for the return struct
+             result.actions.clear();
+             for(const auto& spec : node_ptr->legal_actions) {
+                  result.actions.push_back(spec.to_string());
+             }
         } else {
              spdlog::error("Null pointer found in NodeMap for key: {}", info_set_key);
              result.found = false;

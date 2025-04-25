@@ -1,26 +1,31 @@
 #include "game_state.h" // Corrected include
-#include "spdlog/spdlog.h" // Include spdlog
 #include <numeric>   // For std::accumulate
-#include <algorithm> // For std::min, std::max
+#include <algorithm> // For std::max, std::min, std::find
 #include <stdexcept> // For std::runtime_error
-#include <limits>    // For std::numeric_limits
+#include <sstream>   // For history string
+
+#include "spdlog/spdlog.h" // Include spdlog
+#include "spdlog/fmt/bundled/format.h" // Include fmt for logging vectors
+
 
 namespace gto_solver {
 
-// Constants (assuming standard blinds for now)
-const int SMALL_BLIND_AMOUNT = 1;
-const int BIG_BLIND_AMOUNT = 2;
+// Assume Big Blind size is needed for calculations
+const int BIG_BLIND_SIZE_GS = 2; // TODO: Make configurable, avoid conflict with AA.cpp
 
+// --- Constructor ---
 GameState::GameState(int num_players, int initial_stack, int ante_size, int button_position)
     : num_players_(num_players),
       current_player_index_(-1), // Will be set after blinds
       pot_size_(0),
       player_stacks_(num_players, initial_stack),
       bets_this_round_(num_players, 0),
-      player_hands_(num_players),
+      player_hands_(num_players), // Initialize outer vector
+      community_cards_(),
       current_street_(Street::PREFLOP),
+      action_history_(),
       is_game_over_(false),
-      last_raise_size_(0),
+      last_raise_size_(0), // Initialized properly after blinds
       aggressor_this_round_(-1),
       actions_this_round_(0),
       player_folded_(num_players, false),
@@ -37,90 +42,51 @@ GameState::GameState(int num_players, int initial_stack, int ante_size, int butt
          throw std::invalid_argument("Invalid button position.");
     }
 
-    // Determine SB and BB positions based on button
-    int sb_index = (button_position_ + 1) % num_players_;
-    int bb_index = (button_position_ + 2) % num_players_;
-    // Handle Heads-Up case where BTN is SB
-    if (num_players_ == 2) {
-        sb_index = button_position_;
-        bb_index = (button_position_ + 1) % num_players_;
-    }
-
-    post_antes_and_blinds(sb_index, bb_index, SMALL_BLIND_AMOUNT, BIG_BLIND_AMOUNT);
-
-    // Determine the first player to act preflop
-    if (num_players_ == 2) {
-        current_player_index_ = sb_index; // SB acts first HU
-    } else {
-        current_player_index_ = (bb_index + 1) % num_players_; // UTG acts first 3+ players
-    }
-     // Skip players who might already be all-in from blinds/antes
-     int initial_player = current_player_index_;
-     while(player_all_in_[current_player_index_] || player_folded_[current_player_index_]) {
-         current_player_index_ = (current_player_index_ + 1) % num_players_;
-         if (current_player_index_ == initial_player) {
-              // Everyone is all-in or folded - should likely be terminal
-              spdlog::warn("All players all-in or folded after blinds/antes. Setting game over.");
-              is_game_over_ = true;
-              current_player_index_ = -1; // No one to act
-              break;
-         }
-     }
-
-    spdlog::debug("GameState initialized. Players: {}, Stack: {}, Ante: {}, BTN: {}, SB: {}, BB: {}, First Actor: {}",
-                  num_players_, initial_stack, ante_size_, button_position_, sb_index, bb_index, current_player_index_);
-}
-
-
-void GameState::post_antes_and_blinds(int sb_index, int bb_index, int sb_amount, int bb_amount) {
     // Post Antes
     if (ante_size_ > 0) {
         for (int i = 0; i < num_players_; ++i) {
-            int ante = std::min(ante_size_, player_stacks_[i]);
-            player_stacks_[i] -= ante;
-            player_contributions_[i] += ante;
-            pot_size_ += ante;
+            int post_amount = std::min(ante_size_, player_stacks_[i]);
+            player_stacks_[i] -= post_amount;
+            player_contributions_[i] += post_amount;
+            pot_size_ += post_amount;
             if (player_stacks_[i] == 0) {
-                player_all_in_[i] = true;
+                 player_all_in_[i] = true;
             }
         }
+         spdlog::trace("Ante posted. Pot: {}", pot_size_);
     }
 
-    // Post Small Blind
-    int sb_post = std::min(sb_amount, player_stacks_[sb_index]);
-    player_stacks_[sb_index] -= sb_post;
-    bets_this_round_[sb_index] = sb_post;
-    player_contributions_[sb_index] += sb_post;
-    pot_size_ += sb_post;
-    if (player_stacks_[sb_index] == 0) {
-        player_all_in_[sb_index] = true;
+
+    // Determine SB and BB positions and amounts
+    int sb_index = (button_position_ + 1) % num_players_;
+    int bb_index = (button_position_ + 2) % num_players_;
+    int sb_amount = BIG_BLIND_SIZE_GS / 2;
+    int bb_amount = BIG_BLIND_SIZE_GS;
+
+    // Handle Heads-Up case
+    if (num_players_ == 2) {
+        sb_index = button_position_; // Button is SB in HU
+        bb_index = (button_position_ + 1) % num_players_;
     }
 
-    // Post Big Blind
-    int bb_post = std::min(bb_amount, player_stacks_[bb_index]);
-    player_stacks_[bb_index] -= bb_post;
-    bets_this_round_[bb_index] = bb_post;
-    player_contributions_[bb_index] += bb_post;
-    pot_size_ += bb_post;
-    if (player_stacks_[bb_index] == 0) {
-        player_all_in_[bb_index] = true;
+    // Post Blinds
+    post_antes_and_blinds(sb_index, bb_index, sb_amount, bb_amount);
+
+    // Set initial player to act (UTG or SB in HU)
+    current_player_index_ = (button_position_ + 3) % num_players_;
+    if (num_players_ == 2) {
+        current_player_index_ = sb_index; // SB acts first HU preflop
     }
-
-    // The initial "bet to match" is the Big Blind
-    // The last raise size is effectively the difference between BB and SB (or BB if no SB)
-    last_raise_size_ = bb_amount - sb_amount; // Simplified, assumes SB < BB
-    if (num_players_ == 2) { // HU case, SB posts first, BB is the raise
-         last_raise_size_ = bb_amount - sb_amount; // Still the diff
-    } else if (sb_index == bb_index) { // Should not happen in standard poker
-         last_raise_size_ = bb_amount;
-    }
-    // Ensure last_raise_size is at least the minimum bet (BB) if applicable preflop
-    last_raise_size_ = std::max(last_raise_size_, bb_amount);
+     // Skip players who are already all-in from antes/blinds
+     int initial_actor = current_player_index_;
+     while(player_all_in_[current_player_index_] && std::accumulate(player_all_in_.begin(), player_all_in_.end(), 0) < num_players_) {
+          current_player_index_ = (current_player_index_ + 1) % num_players_;
+          if (current_player_index_ == initial_actor) break; // Avoid infinite loop if everyone is all-in
+     }
 
 
-    aggressor_this_round_ = bb_index; // BB is the initial "aggressor" preflop
-    actions_this_round_ = 0; // Reset action count for the start of preflop betting
-    std::fill(player_acted_this_sequence_.begin(), player_acted_this_sequence_.end(), false);
+    spdlog::trace("GameState Initialized. Players: {}, Stack: {}, Ante: {}, BTN: {}, SB: {}, BB: {}, First Actor: {}",
+                  num_players_, initial_stack, ante_size_, button_position_, sb_index, bb_index, current_player_index_);
 }
 
 
@@ -132,16 +98,36 @@ int GameState::get_pot_size() const { return pot_size_; }
 const std::vector<int>& GameState::get_player_stacks() const { return player_stacks_; }
 const std::vector<Card>& GameState::get_player_hand(int player_index) const {
     if (player_index < 0 || player_index >= num_players_) {
-        throw std::out_of_range("Invalid player index for get_player_hand");
+        static const std::vector<Card> empty_hand;
+        return empty_hand;
     }
     return player_hands_[player_index];
 }
 const std::vector<Card>& GameState::get_community_cards() const { return community_cards_; }
 Street GameState::get_current_street() const { return current_street_; }
 const std::vector<Action>& GameState::get_action_history() const { return action_history_; }
+int GameState::get_amount_to_call(int player_index) const {
+    if (player_index < 0 || player_index >= num_players_) return 0;
+    int max_bet = 0;
+    for (int bet : bets_this_round_) {
+        max_bet = std::max(max_bet, bet);
+    }
+    return max_bet - bets_this_round_[player_index];
+}
+int GameState::get_bet_this_round(int player_index) const {
+     if (player_index < 0 || player_index >= num_players_) return 0;
+     return bets_this_round_[player_index];
+}
+const std::vector<int>& GameState::get_bets_this_round() const {
+     return bets_this_round_;
+}
+// Added getter implementation
+const std::vector<int>& GameState::get_current_bets() const {
+     return bets_this_round_;
+}
 int GameState::get_last_raise_size() const { return last_raise_size_; }
 bool GameState::has_player_folded(int player_index) const {
-     if (player_index < 0 || player_index >= num_players_) return true; // Treat invalid index as folded
+     if (player_index < 0 || player_index >= num_players_) return true;
      return player_folded_[player_index];
 }
 bool GameState::is_player_all_in(int player_index) const {
@@ -152,109 +138,58 @@ int GameState::get_player_contribution(int player_index) const {
      if (player_index < 0 || player_index >= num_players_) return 0;
      return player_contributions_[player_index];
 }
-const std::vector<int>& GameState::get_bets_this_round() const { return bets_this_round_; }
-
-int GameState::get_bet_this_round(int player_index) const {
-    if (player_index < 0 || player_index >= num_players_) {
-        return 0; // Or throw? Return 0 for safety.
-    }
-    return bets_this_round_[player_index];
+int GameState::get_last_raiser() const {
+     return aggressor_this_round_;
 }
-
-int GameState::get_amount_to_call(int player_index) const {
-    if (player_index < 0 || player_index >= num_players_ || player_folded_[player_index] || player_all_in_[player_index]) {
-        return 0; // Cannot call if folded, all-in, or invalid index
-    }
-    int max_bet = 0;
-    for (int bet : bets_this_round_) {
-        max_bet = std::max(max_bet, bet);
-    }
-    int amount_needed = max_bet - bets_this_round_[player_index];
-    // Cannot call more than stack allows
-    return std::min(amount_needed, player_stacks_[player_index]);
-}
-
-
-bool GameState::is_terminal() const {
-    if (is_game_over_) {
-        return true;
-    }
-
-    int active_players = 0;
-    for (int i = 0; i < num_players_; ++i) {
-        if (!player_folded_[i]) {
-            active_players++;
-        }
-    }
-
-    // Terminal if only one player left
-    if (active_players <= 1) {
-        return true;
-    }
-
-    // Terminal if showdown is reached and betting round is over
-    if (current_street_ == Street::SHOWDOWN) {
-        return true; // Showdown is always terminal in this model
-    }
-
-     // Check if betting round is over (only relevant if not already SHOWDOWN)
-     bool betting_over = false;
-     if (actions_this_round_ > 0 && aggressor_this_round_ != -1) { // Check only if there was aggression
-         int players_yet_to_act = 0;
-         int potential_closer = aggressor_this_round_; // Player who needs to be called/folded to
-
-         for (int i = 0; i < num_players_; ++i) {
-             int current_idx = (potential_closer + 1 + i) % num_players_; // Start checking from player after aggressor
-
-             // Skip folded or all-in players (unless they are the aggressor closing action)
-             if (player_folded_[current_idx] || (player_all_in_[current_idx] && current_idx != aggressor_this_round_)) {
-                 continue;
-             }
-
-             // If an active player hasn't matched the bet or hasn't acted in this sequence, betting isn't over
-             if (bets_this_round_[current_idx] < bets_this_round_[potential_closer] || !player_acted_this_sequence_[current_idx]) {
-                  players_yet_to_act++;
-                  break; // Found someone who needs to act
-             }
-         }
-         betting_over = (players_yet_to_act == 0);
-
-     } else if (actions_this_round_ > 0 && aggressor_this_round_ == -1) {
-          // Case: No aggression, but action occurred (e.g., checks around postflop, or BB checks preflop)
-          // Betting is over if everyone active has acted in this sequence (checked)
-          int players_yet_to_act = 0;
-          for(int i=0; i<num_players_; ++i) {
-               if (!player_folded_[i] && !player_all_in_[i] && !player_acted_this_sequence_[i]) {
-                    players_yet_to_act++;
-                    break;
-               }
+int GameState::get_num_active_players() const {
+     // Correction: Count players who haven't folded
+     int count = 0;
+      for(int i=0; i<num_players_; ++i) {
+          if (!player_folded_[i]) {
+               count++;
           }
-          betting_over = (players_yet_to_act == 0);
      }
-     // Preflop special case: If action gets back to BB and there was no raise, betting ends if BB checks.
-     // This is handled implicitly by the logic above when BB acts.
+     return count;
+}
+int GameState::get_num_limpers() const {
+     if (current_street_ != Street::PREFLOP || get_raises_this_street() > 0) {
+          return 0;
+     }
+     int limper_count = 0;
+     int bb_index = (button_position_ + 2) % num_players_;
+     if (num_players_ == 2) bb_index = (button_position_ + 1) % num_players_;
 
+     for(int i=0; i < num_players_; ++i) {
+          if (!player_folded_[i] && !player_all_in_[i] && bets_this_round_[i] == BIG_BLIND_SIZE_GS && i != bb_index) {
+               limper_count++;
+          }
+          else if (!player_folded_[i] && !player_all_in_[i] && bets_this_round_[i] == BIG_BLIND_SIZE_GS / 2 && i == (button_position_ + 1) % num_players_ && num_players_ > 2) {
+               limper_count++;
+          }
+     }
+     return limper_count;
+}
 
-    // If betting is over and it was the river, the game is terminal (go to SHOWDOWN state implicitly)
-    if (betting_over && current_street_ == Street::RIVER) {
-        return true;
-    }
-
-    return false; // Not terminal otherwise
+bool GameState::is_first_to_act_preflop(int player_index) const {
+     if (current_street_ != Street::PREFLOP) return false;
+     int utg_index = (button_position_ + 3) % num_players_;
+      if (num_players_ == 2) utg_index = button_position_;
+      return player_index == utg_index;
 }
 
 
 // --- Modifiers ---
 void GameState::deal_hands(const std::vector<std::vector<Card>>& hands) {
     if (hands.size() != num_players_) {
-        throw std::invalid_argument("Number of hands does not match number of players.");
+        throw std::runtime_error("Number of hands provided does not match number of players.");
     }
     player_hands_ = hands;
+     spdlog::trace("Hands dealt.");
 }
 
 void GameState::deal_community_cards(const std::vector<Card>& cards) {
     community_cards_.insert(community_cards_.end(), cards.begin(), cards.end());
-    // Optionally advance street based on number of cards dealt, but advance_to_next_street is preferred
+     spdlog::trace("Community cards dealt. Board: {}", fmt::join(community_cards_, " "));
 }
 
 void GameState::apply_action(const Action& action) {
@@ -265,197 +200,314 @@ void GameState::apply_action(const Action& action) {
     if (action.player_index != current_player_index_) {
         throw std::runtime_error("Action applied by wrong player.");
     }
+    if (player_folded_[current_player_index_] || player_all_in_[current_player_index_]) {
+         spdlog::warn("Player {} cannot act (folded or all-in). Skipping action.", current_player_index_);
+         update_next_player();
+         return;
+    }
 
-    int player = action.player_index;
+    int player_stack = player_stacks_[current_player_index_];
+    int call_amount = get_amount_to_call(current_player_index_);
+    int current_bet = bets_this_round_[current_player_index_];
+    int amount_committed = 0;
+
     action_history_.push_back(action);
-    player_acted_this_sequence_[player] = true; // Mark player as having acted
-    actions_this_round_++;
+    player_acted_this_sequence_[current_player_index_] = true;
 
     switch (action.type) {
         case Action::Type::FOLD:
-            player_folded_[player] = true;
+            player_folded_[current_player_index_] = true;
+            spdlog::trace("Player {} folds.", current_player_index_);
             break;
+
         case Action::Type::CHECK:
-            // No change in bet amount or pot size
-            if (get_amount_to_call(player) > 0) {
-                 throw std::runtime_error("Invalid action: Check when facing a bet.");
+            if (call_amount != 0) {
+                throw std::runtime_error("Invalid action: Check not allowed when facing a bet.");
             }
-            aggressor_this_round_ = -1; // Checking resets aggression sequence
+            spdlog::trace("Player {} checks.", current_player_index_);
+            actions_this_round_++;
             break;
-        case Action::Type::CALL: {
-            int call_amount = get_amount_to_call(player);
-            if (call_amount == 0 && bets_this_round_[player] > 0) {
-                 // This case handles calling an all-in shove when the caller is already all-in for less.
-                 // Or calling when already matched the bet (shouldn't happen if logic is correct).
-                 spdlog::debug("Player {} called with amount_to_call=0. Current bet: {}", player, bets_this_round_[player]);
-            } else if (call_amount > 0) {
-                 int amount_put_in = std::min(call_amount, player_stacks_[player]);
-                 player_stacks_[player] -= amount_put_in;
-                 bets_this_round_[player] += amount_put_in;
-                 player_contributions_[player] += amount_put_in;
-                 pot_size_ += amount_put_in;
-                 if (player_stacks_[player] == 0) {
-                     player_all_in_[player] = true;
+
+        case Action::Type::CALL:
+            if (call_amount == 0) {
+                 if (current_street_ == Street::PREFLOP && current_player_index_ == (button_position_ + 1) % num_players_ && bets_this_round_[current_player_index_] < BIG_BLIND_SIZE_GS && num_players_ > 2) {
+                      amount_committed = BIG_BLIND_SIZE_GS / 2 - bets_this_round_[current_player_index_];
+                 } else {
+                      spdlog::warn("Player {} attempted to call 0 when check was possible or invalid context.", current_player_index_);
+                      actions_this_round_++;
+                      break;
+                 }
+            } else {
+                 amount_committed = std::min(player_stack, call_amount);
+            }
+
+            spdlog::trace("Player {} calls {}.", current_player_index_, amount_committed);
+            player_stacks_[current_player_index_] -= amount_committed;
+            bets_this_round_[current_player_index_] += amount_committed;
+            player_contributions_[current_player_index_] += amount_committed;
+            pot_size_ += amount_committed;
+            if (player_stacks_[current_player_index_] == 0) {
+                player_all_in_[current_player_index_] = true;
+            }
+            actions_this_round_++;
+            break;
+
+        case Action::Type::BET:
+        case Action::Type::RAISE:
+            if (action.type == Action::Type::BET && call_amount != 0) {
+                throw std::runtime_error("Invalid action: Bet not allowed when facing a bet/raise.");
+            }
+            if (action.type == Action::Type::RAISE && call_amount == 0) {
+                 bool is_bb = (current_player_index_ == (button_position_ + 2) % num_players_) || (num_players_ == 2 && current_player_index_ == (button_position_ + 1) % num_players_);
+                 int max_other_bet = 0;
+                 for(int i=0; i<num_players_; ++i) { if(i != current_player_index_) max_other_bet = std::max(max_other_bet, bets_this_round_[i]); }
+                 if (!(current_street_ == Street::PREFLOP && is_bb && max_other_bet <= BIG_BLIND_SIZE_GS)) {
+                      throw std::runtime_error("Invalid action: Raise not allowed when check is possible (except BB option).");
                  }
             }
-             // Calling does not make you the aggressor
-             // aggressor_this_round_ remains unchanged unless it was -1 (check)
-             if (aggressor_this_round_ == -1) {
-                  // This implies someone checked, and then someone bet, and now we are calling.
-                  // Find the actual aggressor.
-                  int max_bet = 0;
-                  int current_aggressor = -1;
-                  for(int i=0; i<num_players_; ++i) {
-                       if(bets_this_round_[i] > max_bet) {
-                            max_bet = bets_this_round_[i];
-                            current_aggressor = i;
-                       }
-                  }
-                  aggressor_this_round_ = current_aggressor;
+
+            int total_bet_amount = action.amount;
+            int bet_increment = total_bet_amount - current_bet;
+
+            if (bet_increment <= 0) {
+                 throw std::runtime_error("Invalid bet/raise amount: Increment must be positive.");
+            }
+            if (bet_increment > player_stack) {
+                 spdlog::warn("Player {} bet/raise amount {} capped by stack {}. Going all-in.", current_player_index_, bet_increment, player_stack);
+                 bet_increment = player_stack;
+                 total_bet_amount = current_bet + player_stack;
+                 player_all_in_[current_player_index_] = true;
+            }
+
+            // Check min-raise rule
+            int num_raises_this_street = get_raises_this_street(); // Calculate raises on this street
+            int min_raise_increment = (last_raise_size_ > 0) ? last_raise_size_ : BIG_BLIND_SIZE_GS;
+             if (current_street_ == Street::PREFLOP && num_raises_this_street == 0) {
+                  min_raise_increment = BIG_BLIND_SIZE_GS;
              }
+            int actual_raise_increment = total_bet_amount - (current_bet + call_amount);
 
-            break;
-        }
-        case Action::Type::BET:
-        case Action::Type::RAISE: {
-            if (action.type == Action::Type::BET && get_amount_to_call(player) > 0) {
-                 throw std::runtime_error("Invalid action: Bet when facing a bet (should be Raise).");
-            }
-             if (action.type == Action::Type::RAISE && get_amount_to_call(player) == 0) {
-                  // Allow raise when amount_to_call is 0 only if it's preflop BB option? No, should be BET.
-                  // Let's treat it as a BET if amount_to_call is 0.
-                  // throw std::runtime_error("Invalid action: Raise when not facing a bet (should be Bet).");
-                  spdlog::warn("Action type RAISE received when amount_to_call is 0. Treating as BET.");
-             }
-
-            int amount_committed_total = action.amount; // Total amount player wants committed this round
-            int current_bet = bets_this_round_[player];
-            int additional_amount = amount_committed_total - current_bet;
-
-            if (additional_amount <= 0) {
-                 throw std::runtime_error("Invalid bet/raise amount: Must be greater than current bet.");
-            }
-            if (additional_amount > player_stacks_[player]) {
-                 // This indicates an attempt to bet/raise more than stack, treat as all-in
-                 spdlog::debug("Bet/Raise amount {} exceeds stack {}. Treating as All-In.", additional_amount, player_stacks_[player]);
-                 additional_amount = player_stacks_[player];
-                 amount_committed_total = current_bet + additional_amount; // Adjust total commit
+            if (action.type == Action::Type::RAISE && actual_raise_increment < min_raise_increment && !player_all_in_[current_player_index_]) {
+                 int min_legal_total_bet = current_bet + call_amount + min_raise_increment;
+                 if (player_stack + current_bet >= min_legal_total_bet) {
+                      spdlog::warn("Player {} raise amount {} (increment {}) too small (min inc {}), forcing min-raise to {}.",
+                                   current_player_index_, total_bet_amount, actual_raise_increment, min_raise_increment, min_legal_total_bet);
+                      total_bet_amount = min_legal_total_bet;
+                      bet_increment = total_bet_amount - current_bet;
+                 } else {
+                      throw std::runtime_error("Invalid raise amount: Too small and cannot make min-raise.");
+                 }
             }
 
-            // Min-raise check (simplified: must raise by at least the last raise amount, or BB preflop)
-            int call_amount = get_amount_to_call(player);
-            int raise_increment = amount_committed_total - (current_bet + call_amount);
-            int min_increment = (last_raise_size_ > 0) ? last_raise_size_ : BIG_BLIND_AMOUNT; // Use BB as min preflop/if no prior raise
-
-            // Exception: If going all-in for less than a min-raise, it's allowed.
-            bool is_all_in_commit = (additional_amount == player_stacks_[player]);
-            if (!is_all_in_commit && raise_increment < min_increment) {
-                 // If not all-in, must meet min-raise
-                 throw std::runtime_error("Invalid raise amount: Raise increment " + std::to_string(raise_increment) + " is less than minimum " + std::to_string(min_increment));
+            spdlog::trace("Player {} {}s to {}.", current_player_index_, (action.type == Action::Type::BET ? "bet" : "raise"), total_bet_amount);
+            player_stacks_[current_player_index_] -= bet_increment;
+            bets_this_round_[current_player_index_] += bet_increment;
+            player_contributions_[current_player_index_] += bet_increment;
+            pot_size_ += bet_increment;
+            if (player_stacks_[current_player_index_] == 0 && !player_all_in_[current_player_index_]) {
+                player_all_in_[current_player_index_] = true;
             }
 
-
-            player_stacks_[player] -= additional_amount;
-            bets_this_round_[player] += additional_amount;
-            player_contributions_[player] += additional_amount;
-            pot_size_ += additional_amount;
-            if (player_stacks_[player] == 0) {
-                player_all_in_[player] = true;
-            }
-
-            // Update aggression state
-            last_raise_size_ = raise_increment; // The amount *added* on top of the call
-            aggressor_this_round_ = player;
-            actions_this_round_ = 1; // Reset action count after aggression
-            // Reset acted flags for others
+            last_raise_size_ = actual_raise_increment;
+            aggressor_this_round_ = current_player_index_;
+            actions_this_round_ = 1;
             std::fill(player_acted_this_sequence_.begin(), player_acted_this_sequence_.end(), false);
-            player_acted_this_sequence_[player] = true; // Aggressor has acted
+            player_acted_this_sequence_[current_player_index_] = true;
 
             break;
+    }
+
+    // --- Check for End of Round / Street / Hand ---
+    int active_players_remaining = 0;
+    int players_can_still_act = 0;
+    for(int i=0; i<num_players_; ++i) {
+        if (!player_folded_[i]) {
+            active_players_remaining++;
+            if (!player_all_in_[i]) {
+                 players_can_still_act++;
+            }
         }
     }
 
-    // Check if betting round is over or game is over
-    if (is_terminal()) {
+    if (active_players_remaining <= 1) {
         is_game_over_ = true;
-        current_player_index_ = -1; // No more actions
-        // If betting ended on river, implicitly move to SHOWDOWN state
-        if (current_street_ == Street::RIVER) {
-             // Check if betting actually ended this action
-             bool betting_over = false;
-             int active_players = 0;
-             int players_all_in_or_folded = 0;
-             int max_bet = 0;
-             for(int bet : bets_this_round_) max_bet = std::max(max_bet, bet);
-
-             for(int i=0; i<num_players_; ++i) {
-                  if (!player_folded_[i]) {
-                       active_players++;
-                       if (player_all_in_[i] || bets_this_round_[i] == max_bet) {
-                            players_all_in_or_folded++;
-                       }
-                  } else {
-                       players_all_in_or_folded++;
-                  }
-             }
-             // Betting is over if all active players are all-in or have matched the max bet
-             // Or if only one active player remains
-             if (active_players <= 1 || active_players == players_all_in_or_folded) {
-                  betting_over = true;
-             }
-
-
-             if (betting_over) {
-                  current_street_ = Street::SHOWDOWN;
-                  spdlog::debug("River betting concluded. Moving to SHOWDOWN. History: {}", get_history_string());
-             }
-        }
+        spdlog::trace("Hand over - only one player remaining.");
     } else {
-        update_next_player();
-        // Check if the next player starts a new betting round
-        if (current_player_index_ == -1) { // Indicates betting round ended
-             advance_to_next_street();
+        bool betting_round_over = true;
+        int max_bet = 0;
+        for(int bet : bets_this_round_) max_bet = std::max(max_bet, bet);
+
+        for(int i=0; i<num_players_; ++i) {
+            if (!player_folded_[i] && !player_all_in_[i]) {
+                if (bets_this_round_[i] < max_bet || !player_acted_this_sequence_[i]) {
+                    betting_round_over = false;
+                    break;
+                }
+            }
+        }
+         int bb_index = (button_position_ + 2) % num_players_;
+         if (num_players_ == 2) bb_index = (button_position_ + 1) % num_players_;
+         if (current_street_ == Street::PREFLOP && aggressor_this_round_ == -1 && !player_acted_this_sequence_[bb_index] && !player_all_in_[bb_index] && !player_folded_[bb_index]) {
+              betting_round_over = false;
+         }
+
+
+        if (betting_round_over) {
+            spdlog::trace("Betting round over for street {}.", static_cast<int>(current_street_));
+            if (current_street_ == Street::RIVER || players_can_still_act <= 1) {
+                is_game_over_ = true;
+                current_street_ = Street::SHOWDOWN;
+                 spdlog::trace("Hand over - River betting complete or <=1 player can act.");
+            } else {
+                advance_to_next_street();
+            }
+        } else {
+            update_next_player();
         }
     }
 }
 
-
 void GameState::advance_to_next_street() {
-    if (current_street_ == Street::RIVER || current_street_ == Street::SHOWDOWN) {
-        current_street_ = Street::SHOWDOWN;
-        is_game_over_ = true;
-        current_player_index_ = -1;
-        return;
-    }
-
-    // Move pot contributions from bets_this_round_ conceptually (already added to pot_size_)
-    reset_bets_for_new_street();
-
-    // Determine next street
     if (current_street_ == Street::PREFLOP) current_street_ = Street::FLOP;
     else if (current_street_ == Street::FLOP) current_street_ = Street::TURN;
     else if (current_street_ == Street::TURN) current_street_ = Street::RIVER;
+    else {
+        is_game_over_ = true;
+        current_street_ = Street::SHOWDOWN;
+        return;
+    }
+    spdlog::trace("Advancing to street {}.", static_cast<int>(current_street_));
+    reset_bets_for_new_street();
 
-    // Determine first player to act postflop (first active player after button)
     current_player_index_ = (button_position_ + 1) % num_players_;
+    int initial_actor = current_player_index_;
     while(player_folded_[current_player_index_] || player_all_in_[current_player_index_]) {
          current_player_index_ = (current_player_index_ + 1) % num_players_;
-         // Check if we wrapped around - should only happen if all remaining are all-in
-         if (current_player_index_ == (button_position_ + 1) % num_players_) {
-              spdlog::debug("All remaining players are all-in. Advancing street to {}", static_cast<int>(current_street_));
-              // If we reach river this way, game should end
-              if (current_street_ == Street::RIVER) {
-                   current_street_ = Street::SHOWDOWN;
-                   is_game_over_ = true;
-                   current_player_index_ = -1;
-              }
-              // Otherwise, just deal next cards, no one can act.
-              // We might need to call advance_to_next_street again immediately.
-              // This logic might need refinement for sequential all-ins across streets.
+         if (current_player_index_ == initial_actor) {
+              spdlog::warn("No player can act postflop, forcing showdown/end.");
+              is_game_over_ = true;
+              current_street_ = Street::SHOWDOWN;
+              current_player_index_ = -1;
               break;
          }
     }
-     spdlog::debug("Advanced to street {}. First player to act: {}", static_cast<int>(current_street_), current_player_index_);
+     if (!is_game_over_) {
+          spdlog::trace("First player to act on new street: {}", current_player_index_);
+     }
+}
+
+// --- Utility ---
+std::string GameState::get_history_string() const {
+    std::stringstream ss;
+    // TODO: Improve history string to be more robust / less ambiguous
+    for (const auto& action : action_history_) {
+        switch (action.type) {
+            case Action::Type::FOLD:  ss << "f"; break;
+            case Action::Type::CHECK: ss << "k"; break;
+            case Action::Type::CALL:  ss << "c"; break;
+            case Action::Type::BET:   ss << "b" << action.amount; break;
+            case Action::Type::RAISE: ss << "r" << action.amount; break;
+        }
+        ss << "/";
+    }
+    return ss.str();
+}
+
+int GameState::get_effective_stack(int player_index) const {
+     if (player_index < 0 || player_index >= num_players_) return 0;
+     int min_stack = player_stacks_[player_index];
+     for(int i=0; i<num_players_; ++i) {
+          if (i != player_index && !player_folded_[i]) {
+               min_stack = std::min(min_stack, player_stacks_[i]);
+          }
+     }
+     // Effective stack should not include current player's bet this round
+     return min_stack;
+}
+
+int GameState::get_raises_this_street() const {
+     int raise_count = 0;
+     // TODO: Implement proper tracking of raises per street using action_history_ or dedicated counter
+     // This simplified version is inaccurate for multi-street scenarios.
+     for(const auto& action : action_history_) {
+          if (action.type == Action::Type::RAISE || action.type == Action::Type::BET) {
+               // Need to differentiate bet from raise based on context (amount_to_call at that point)
+               // For simplicity now, count both as potential raises/bets
+               raise_count++;
+          }
+     }
+     return raise_count;
+}
+
+
+// --- Private Helpers ---
+void GameState::post_antes_and_blinds(int sb_index, int bb_index, int sb_amount, int bb_amount) {
+     if (sb_index >= 0 && sb_index < num_players_) {
+          int post_amount = std::min(sb_amount, player_stacks_[sb_index]);
+          player_stacks_[sb_index] -= post_amount;
+          bets_this_round_[sb_index] = post_amount;
+          player_contributions_[sb_index] += post_amount;
+          pot_size_ += post_amount;
+          if (player_stacks_[sb_index] == 0) player_all_in_[sb_index] = true;
+          spdlog::trace("Player {} posts SB {}", sb_index, post_amount);
+     }
+     if (bb_index >= 0 && bb_index < num_players_) {
+          int post_amount = std::min(bb_amount, player_stacks_[bb_index]);
+          player_stacks_[bb_index] -= post_amount;
+          bets_this_round_[bb_index] = post_amount;
+          player_contributions_[bb_index] += post_amount;
+          pot_size_ += post_amount;
+          if (player_stacks_[bb_index] == 0) player_all_in_[bb_index] = true;
+          spdlog::trace("Player {} posts BB {}", bb_index, post_amount);
+     }
+     last_raise_size_ = bb_amount; // Initial "raise" size is the BB
+     aggressor_this_round_ = bb_index;
+     actions_this_round_ = 0;
+     std::fill(player_acted_this_sequence_.begin(), player_acted_this_sequence_.end(), false);
+}
+
+void GameState::update_next_player() {
+    if (is_game_over_) {
+        current_player_index_ = -1;
+        return;
+    }
+    int start_index = current_player_index_;
+    do {
+        current_player_index_ = (current_player_index_ + 1) % num_players_;
+        if (current_player_index_ == start_index) break;
+        if (!player_folded_[current_player_index_] && !player_all_in_[current_player_index_]) break;
+    } while (true);
+
+     if (current_player_index_ == start_index && (player_folded_[current_player_index_] || player_all_in_[current_player_index_])) {
+          bool can_anyone_act = false;
+          for(int i=0; i<num_players_; ++i) {
+               if (!player_folded_[i] && !player_all_in_[i]) {
+                    can_anyone_act = true;
+                    break;
+               }
+          }
+          if (!can_anyone_act) {
+               spdlog::trace("No player can act, advancing street/ending hand.");
+               if (current_street_ == Street::RIVER) {
+                    is_game_over_ = true;
+                    current_street_ = Street::SHOWDOWN;
+                    current_player_index_ = -1;
+               } else {
+                    // This case should ideally be caught by betting_round_over logic in apply_action
+                    // If betting round is over because only all-in/folded players remain,
+                    // apply_action should call advance_to_next_street.
+                    spdlog::debug("update_next_player found no one can act, but not River. State should likely advance.");
+                    // To prevent potential infinite loops if apply_action logic fails, force advance here? Risky.
+                    // Let's assume apply_action handles the betting_round_over condition correctly.
+                    current_player_index_ = -1; // Indicate no one can act now
+                    is_game_over_ = true; // Force end if stuck
+                    current_street_ = Street::SHOWDOWN;
+               }
+          } else {
+               spdlog::error("update_next_player loop finished but active player found?");
+          }
+     }
+     spdlog::trace("Next player to act: {}", current_player_index_);
 }
 
 void GameState::reset_bets_for_new_street() {
@@ -466,206 +518,53 @@ void GameState::reset_bets_for_new_street() {
     std::fill(player_acted_this_sequence_.begin(), player_acted_this_sequence_.end(), false);
 }
 
+bool GameState::is_terminal() const {
+     if (is_game_over_) return true;
 
-void GameState::update_next_player() {
-    if (is_game_over_) {
-        current_player_index_ = -1;
-        return;
-    }
-
-    int current_actor = current_player_index_;
-    int potential_closer = aggressor_this_round_;
-    int max_bet = 0;
-    for(int bet : bets_this_round_) max_bet = std::max(max_bet, bet);
-
-    int active_players_remaining = 0;
-    int players_able_to_act = 0; // Count players not folded and not all-in
-
-    for(int i=0; i<num_players_; ++i) {
-        if (!player_folded_[i]) {
-             active_players_remaining++;
-             if (!player_all_in_[i]) {
-                  players_able_to_act++;
-             }
-        }
-    }
-
-    if (active_players_remaining <= 1) {
-         is_game_over_ = true;
-         current_player_index_ = -1;
-         // If only one player left, advance to showdown immediately if river, otherwise next street
-         if (current_street_ == Street::RIVER) current_street_ = Street::SHOWDOWN;
-         // else advance_to_next_street(); // Let the main loop handle street advance
-         return;
-    }
-
-
-    // Loop to find the next player who needs to act
-    int next_player = (current_actor + 1) % num_players_;
-    int checked_players = 0;
-    while(checked_players < num_players_) {
-         // Skip folded players
-         if (player_folded_[next_player]) {
-              next_player = (next_player + 1) % num_players_;
-              checked_players++;
-              continue;
-         }
-         // Skip players who are all-in (they cannot act)
-         if (player_all_in_[next_player]) {
-              next_player = (next_player + 1) % num_players_;
-              checked_players++;
-              continue;
-         }
-
-         // Check if this player needs to act
-         // Condition 1: There was aggression, and this player hasn't acted since OR hasn't matched the bet
-         // Condition 2: There was no aggression, and this player hasn't acted yet (checked)
-         bool needs_to_act = false;
-         if (aggressor_this_round_ != -1) { // Aggression occurred
-              if (!player_acted_this_sequence_[next_player] || bets_this_round_[next_player] < max_bet) {
-                   needs_to_act = true;
-              }
-         } else { // No aggression (checks or initial preflop state before UTG)
-              if (!player_acted_this_sequence_[next_player]) {
-                   needs_to_act = true;
-              }
-         }
-
-
-         if (needs_to_act) {
-              current_player_index_ = next_player;
-              return; // Found next player
-         }
-
-         // If this player doesn't need to act, move to the next
-         next_player = (next_player + 1) % num_players_;
-         checked_players++;
-    }
-
-    // If we loop through everyone and no one needs to act, the betting round is over.
-    current_player_index_ = -1; // Signal end of round
-    spdlog::debug("Betting round concluded on street {}. History: {}", static_cast<int>(current_street_), get_history_string());
-
-}
-
-
-// --- Utility ---
-std::string GameState::get_history_string() const {
-    std::string history = "";
-     // Include street transitions? Maybe later.
-     // For now, just concatenate actions.
-     // Use simple delimiters for now.
-     Street last_street = Street::PREFLOP;
-     for (const auto& action : action_history_) {
-          if (action.type == Action::Type::FOLD) history += "f";
-          else if (action.type == Action::Type::CHECK) history += "k";
-          else if (action.type == Action::Type::CALL) history += "c";
-          else if (action.type == Action::Type::BET) history += "b" + std::to_string(action.amount);
-          else if (action.type == Action::Type::RAISE) history += "r" + std::to_string(action.amount);
-          // Add player index? Maybe too verbose.
-          history += "_"; // Separator
-     }
-     // Remove trailing separator if exists
-     if (!history.empty()) {
-          history.pop_back();
-     }
-    return history;
-}
-
-// --- New Helper Functions ---
-
-int GameState::get_effective_stack(int player_index) const {
-    if (player_index < 0 || player_index >= num_players_) return 0;
-
-    // Stack at the beginning of the current betting round for the player
-    // This requires tracking stack sizes at the start of the street, which we don't explicitly do.
-    // Approximation: Current stack + amount bet this round.
-    int current_player_potential = player_stacks_[player_index] + bets_this_round_[player_index];
-
-    int min_opponent_potential = std::numeric_limits<int>::max();
-    bool opponent_found = false;
-
-    for (int i = 0; i < num_players_; ++i) {
-        // Consider only opponents who are not folded
-        if (i != player_index && !player_folded_[i]) {
-             // Their potential amount is their current stack + what they've bet this round
-             min_opponent_potential = std::min(min_opponent_potential, player_stacks_[i] + bets_this_round_[i]);
-             opponent_found = true;
-        }
-    }
-
-    if (!opponent_found) {
-        return player_stacks_[player_index]; // Should not happen if game not over, but return current stack
-    }
-
-    // Effective stack is the minimum of player's potential and smallest opponent's potential
-    return std::min(current_player_potential, min_opponent_potential);
-}
-
-int GameState::get_raises_this_street() const {
-    int raise_count = 0;
-    // Find the start of the current street in the history
-    size_t start_of_street_idx = 0;
-    // TODO: Need a robust way to find the start of the current street in action_history_
-    // For now, just count all raises in the entire history (inaccurate postflop)
-    for(const auto& action : action_history_) {
-         if (action.type == Action::Type::RAISE || action.type == Action::Type::BET) {
-              raise_count++;
-         }
-    }
-
-     // Preflop: BB is the first "raise level" if no voluntary action yet
-     if (current_street_ == Street::PREFLOP && raise_count == 0) {
-          bool voluntary_action_taken = false;
-          for(const auto& action : action_history_) {
-               if (action.type == Action::Type::CALL || action.type == Action::Type::RAISE) {
-                    voluntary_action_taken = true;
-                    break;
-               }
-          }
-          if (!voluntary_action_taken) {
-               raise_count = 1; // Count the BB post as the first raise level
+     int active_count = 0;
+     for(int i=0; i<num_players_; ++i) {
+          if (!player_folded_[i]) {
+               active_count++;
           }
      }
-    return raise_count;
-}
+     if (active_count <= 1) {
+          return true;
+     }
 
-bool GameState::is_first_to_act_preflop(int player_index) const {
-     if (current_street_ != Street::PREFLOP) return false;
-     // Check if any voluntary action (call or raise) happened before this player
-     for(const auto& action : action_history_) {
-          // BET is only possible postflop, so check CALL or RAISE preflop
-          if (action.type == Action::Type::CALL || action.type == Action::Type::RAISE) {
-               return false; // Someone already acted voluntarily
+     if (current_street_ == Street::SHOWDOWN) {
+          return true;
+     }
+
+     int players_can_bet = 0;
+      for(int i=0; i<num_players_; ++i) {
+          if (!player_folded_[i] && !player_all_in_[i]) {
+               players_can_bet++;
           }
      }
-     // If no voluntary actions yet, the current player *is* the first to act.
-     return player_index == current_player_index_;
-}
+      if (players_can_bet <= 1) {
+           bool betting_closed = true;
+           int max_bet = 0;
+           for(int bet : bets_this_round_) max_bet = std::max(max_bet, bet);
+           for(int i=0; i<num_players_; ++i) {
+                if (!player_folded_[i] && !player_all_in_[i]) {
+                     if (bets_this_round_[i] < max_bet || !player_acted_this_sequence_[i]) {
+                          betting_closed = false;
+                          break;
+                     }
+                }
+           }
+            int bb_index = (button_position_ + 2) % num_players_;
+            if (num_players_ == 2) bb_index = (button_position_ + 1) % num_players_;
+            if (current_street_ == Street::PREFLOP && aggressor_this_round_ == -1 && !player_acted_this_sequence_[bb_index] && !player_all_in_[bb_index] && !player_folded_[bb_index]) {
+                 betting_closed = false;
+            }
 
-int GameState::get_num_limpers() const {
-     if (current_street_ != Street::PREFLOP) return 0;
-     int limpers = 0;
-     int bb_index = (num_players_ == 2) ? (button_position_ + 1) % num_players_ : (button_position_ + 2) % num_players_;
-     bool raise_occurred = false;
-     for(const auto& action : action_history_) {
-          if (action.type == Action::Type::RAISE) {
-               raise_occurred = true;
-               break;
-          }
-          // Count calls that exactly match the BB amount as limps (excluding BB itself)
-          // This needs refinement based on exact blind structure and amounts
-          int sb_index = (num_players_ == 2) ? button_position_ : (button_position_ + 1) % num_players_;
-          if (action.type == Action::Type::CALL && action.player_index != bb_index) {
-               // Check if the amount called makes the total bet equal to BB
-               // This requires knowing the amount put in by the player in this action, not just the action type.
-               // We need to look at the state *before* this action to know the bet they were facing.
-               // Simplified: Assume any call before a raise (not by BB) is a limp. This is inaccurate.
-               // TODO: Refine limp counting logic based on actual amounts called relative to BB.
-               limpers++;
-          }
-     }
-     return raise_occurred ? 0 : limpers;
+           if (betting_closed && current_street_ == Street::RIVER) {
+                return true;
+           }
+      }
+
+     return false;
 }
 
 } // namespace gto_solver

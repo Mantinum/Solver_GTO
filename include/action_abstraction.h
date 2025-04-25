@@ -3,35 +3,59 @@
 
 #include <vector>
 #include <string>
-#include <vector> // Ensure vector is included
+#include <map> // Include map
+
+// Forward declaration
+namespace gto_solver { class GameState; }
 
 namespace gto_solver {
 
-class GameState; // Forward declaration
+// Define Action Types and Sizings more formally
+enum class ActionType { FOLD, CHECK, CALL, BET, RAISE, ALL_IN };
+enum class SizingUnit { BB, PCT_POT, MULTIPLIER_X, ABSOLUTE }; // ABSOLUTE for all-in amount
+
+struct ActionSpec {
+    ActionType type;
+    double value = 0.0; // e.g., 3.0 for BB/X, 50 for PCT, or absolute amount for ALL_IN
+    SizingUnit unit = SizingUnit::BB; // Default unit, relevant for BET/RAISE
+
+    // Helper to convert to string (for compatibility or logging)
+    std::string to_string() const;
+
+    // Comparison operators needed for use in std::set
+    bool operator==(const ActionSpec& other) const {
+        return type == other.type &&
+               unit == other.unit &&
+               std::abs(value - other.value) < 1e-5; // Compare doubles with tolerance
+    }
+
+    bool operator<(const ActionSpec& other) const {
+        if (type != other.type) return type < other.type;
+        if (unit != other.unit) return unit < other.unit;
+        return value < other.value; // Simple comparison for ordering
+    }
+};
+
 
 class ActionAbstraction {
 public:
-    // TODO: Allow configuration of bet sizes (e.g., fractions of pot, fixed amounts)
     ActionAbstraction();
 
-    // Returns specific action strings like "fold", "call", "check", "raise_3bb", "raise_half_pot", "all_in"
-    std::vector<std::string> get_possible_actions(const GameState& current_state) const;
+    // Returns a vector of possible action specifications
+    std::vector<ActionSpec> get_possible_action_specs(const GameState& current_state) const;
 
-    // Helper to calculate the bet/raise amount for a given action string and state
-    // Returns -1 if the action string doesn't imply an amount (fold, call, check)
-    int get_action_amount(const std::string& action_str, const GameState& current_state) const;
+    // Calculates the actual integer amount for a given ActionSpec and state
+    int get_action_amount(const ActionSpec& action_spec, const GameState& current_state) const;
+
+    // --- Deprecated string-based methods (keep for now for compatibility?) ---
+    // std::vector<std::string> get_possible_actions(const GameState& current_state) const;
+    // int get_action_amount(const std::string& action_str, const GameState& current_state) const;
+    // ---
 
 private:
-    // Define abstract bet/raise sizes as fractions of the pot
-    const double BET_FRACTION_SMALL = 0.33;
-    const double BET_FRACTION_MEDIUM = 0.50; // Keep existing one
-    const double BET_FRACTION_LARGE = 0.75;
-    // const double BET_FRACTION_OVERBET = 1.25; // Example for later
-
-    // Define preflop open raise sizes in big blinds
-    // We'll generate strings like "raise_2.2bb", "raise_2.5bb", "raise_3bb"
-    // No specific constants needed here if handled in .cpp
-    // TODO: Add constants or logic for 3-bet, 4-bet sizing etc.
+    // Potential internal helper methods for specific sizings
+    // void add_rfi_actions(std::set<ActionSpec>& actions_set, const GameState& state) const;
+    // ... etc ...
 };
 
 } // namespace gto_solver
