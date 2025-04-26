@@ -103,6 +103,11 @@ std::vector<ActionSpec> ActionAbstraction::get_possible_action_specs(const GameS
                       actions_set.insert({ActionType::RAISE, open_size_bb_small, SizingUnit::BB});
                       actions_set.insert({ActionType::RAISE, 2.5, SizingUnit::BB});
                       actions_set.insert({ActionType::RAISE, 3.0, SizingUnit::BB});
+                      actions_set.insert({ActionType::FOLD}); // <<< AJOUTER FOLD POUR RFI
+                 } else {
+                      // Not SB or first actor, but no bet/limp? Should be CHECK or FOLD only.
+                      // Check is added later in filtering if amount_to_call == 0
+                      actions_set.insert({ActionType::FOLD});
                  }
             }
             else if (!facing_bet_or_raise && num_limpers > 0) { // Facing limper(s)
@@ -255,8 +260,12 @@ int ActionAbstraction::get_action_amount(const ActionSpec& action_spec, const Ga
                   bool is_bb = (current_player == (current_state.get_button_position() + 2) % current_state.get_num_players()) || (current_state.get_num_players() == 2 && current_player == (current_state.get_button_position() + 1) % current_state.get_num_players());
                   int max_other_bet = 0;
                   for(int i=0; i<current_state.get_num_players(); ++i) { if(i != current_player) max_other_bet = std::max(max_other_bet, current_state.get_bet_this_round(i)); }
+                  
+                  // CORRECTION: Ne pas rejeter les raises quand amount_to_call == 0 (cas RFI)
+                  // Convertir en BET si nécessaire, mais ne pas retourner d'erreur
                   if (!(current_state.get_current_street() == Street::PREFLOP && is_bb && max_other_bet <= BIG_BLIND_SIZE)) {
-                       spdlog::error("RAISE specified but check is possible (and not BB option)"); return -1;
+                       // Ne pas retourner d'erreur, traiter comme un BET
+                       spdlog::debug("Converting RAISE to BET since amount_to_call == 0");
                   }
              }
 

@@ -124,3 +124,12 @@ target_include_directories(cfr_engine_test PRIVATE
     ${nlohmann_json_SOURCE_DIR}/include # Add include dir for nlohmann/json
 )
 gtest_discover_tests(cfr_engine_test)
+
+
+add_executable(action_abstraction_fix_test
+        test/action_abstraction_fix_test.cpp
+        src/action_abstraction.cpp
+        src/game_state.cpp
+)
+target_link_libraries(action_abstraction_fix_test GTest::gtest GTest::gtest_main spdlog::spdlog)
+gtest_discover_tests(action_abstraction_fix_test)

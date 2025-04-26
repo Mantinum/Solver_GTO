@@ -15,6 +15,7 @@
 
 #include "spdlog/spdlog.h" // Include spdlog
 #include "spdlog/sinks/stdout_color_sinks.h" // For console logging
+#include "spdlog/fmt/bundled/format.h" // Include fmt for logging vectors
 #include <cstdlib> // For std::atoi, std::atof (or use C++ streams/std::stoi etc.)
 #include <stdexcept> // For std::invalid_argument in parsing
 #include <iomanip> // For std::setw, std::fixed, std::setprecision
@@ -116,8 +117,9 @@ void display_strategy_grid(
                                     else if (action == "call") display_char = 'C';
                                     else if (action == "check") display_char = 'K';
                                     else if (action == "all_in") display_char = 'A';
-                                    else if (action.find("raise") != std::string::npos) display_char = 'R';
-                                    else if (action.find("bet") != std::string::npos) display_char = 'B';
+                                    else if (action.find("raise") != std::string::npos) display_char = 'R'; // Keep R for raise
+                                    else if (action.find("bet") != std::string::npos) display_char = 'R'; // Marquer les bets comme R aussi
+                                    else if (action.find("open") != std::string::npos) display_char = 'R'; // Marquer les open comme R aussi
                                     else display_char = '?'; // Unknown action format
                                } else { display_char = '-'; } // Strategy likely empty or all zeros
                          }
@@ -127,8 +129,9 @@ void display_strategy_grid(
                         if (action == "call") display_char = 'C';
                         else if (action == "check") display_char = 'K';
                         else if (action == "all_in") display_char = 'A';
-                        else if (action.find("raise") != std::string::npos) display_char = 'R';
-                        else if (action.find("bet") != std::string::npos) display_char = 'B';
+                        else if (action.find("raise") != std::string::npos) display_char = 'R'; // Keep R for raise
+                        else if (action.find("bet") != std::string::npos) display_char = 'R'; // Marquer les bets comme R aussi
+                        else if (action.find("open") != std::string::npos) display_char = 'R'; // Marquer les open comme R aussi
                         else display_char = '?'; // Unknown action format
                     }
                 } else if (info.found && !info.strategy.empty()) {
@@ -141,7 +144,7 @@ void display_strategy_grid(
         std::cout << std::endl;
     }
      std::cout << "----------------------------------------------------------------------" << std::endl;
-     std::cout << "Legend: R=Raise, C=Call/Limp, F=Fold, K=Check, A=All-in, .=NotFound, E=SizeError, ?=UnknownAction, -=No Action" << std::endl << std::endl;
+     std::cout << "Legend: R=Raise/Bet, C=Call/Limp, F=Fold, K=Check, A=All-in, .=NotFound, E=SizeError, ?=UnknownAction, -=No Action" << std::endl << std::endl;
 }
 
 // Function to export strategies to JSON
@@ -237,9 +240,12 @@ int main(int argc, char* argv[]) { // Modified main signature
     // --- Setup Logging ---
     try {
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        console_sink->set_level(spdlog::level::info);
+        console_sink->set_level(spdlog::level::info); // Set level to info
+        // Set level to debug to see debug logs:
+        // console_sink->set_level(spdlog::level::debug);
         spdlog::logger logger("gto_solver_logger", {console_sink});
-        logger.set_level(spdlog::level::info);
+        logger.set_level(spdlog::level::info); // Set logger level to info
+        // logger.set_level(spdlog::level::debug); // Set logger level to debug
         logger.flush_on(spdlog::level::info);
         spdlog::set_default_logger(std::make_shared<spdlog::logger>(logger));
         spdlog::info("Logging initialized.");
@@ -260,7 +266,7 @@ int main(int argc, char* argv[]) { // Modified main signature
     if (!json_export_file.empty()) spdlog::info("JSON Export File: {}", json_export_file); // Log JSON export file
 
 
-    try {
+    try { // START MAIN TRY BLOCK
         // --- Initialization ---
         spdlog::info("Initializing modules...");
         gto_solver::HandGenerator hand_generator;
@@ -278,65 +284,105 @@ int main(int argc, char* argv[]) { // Modified main signature
         // Define positions based on num_players
         std::map<std::string, int> position_map;
         if (num_players == 6) {
+            // Corrected 6-max positions relative to BTN=0: SB=1, BB=2, UTG=3, MP=4, CO=5
             position_map = {{"UTG", 3}, {"MP", 4}, {"CO", 5}, {"BTN", 0}, {"SB", 1}};
         } else if (num_players == 2) {
-             position_map = {{"SB", 0}};
+             position_map = {{"SB", 0}}; // BTN=SB=0, BB=1
         } else {
              spdlog::warn("RFI extraction only implemented for 6-max and HU.");
-             return 0;
+             // Continue without extraction if not 6-max or HU
         }
 
-        auto all_hands_str = hand_generator.generate_hands();
+        if (!position_map.empty()) { // Proceed only if positions are defined
+            auto all_hands_str = hand_generator.generate_hands();
 
-        // Store strategies per position using StrategyInfo
-        std::map<std::string, std::map<std::string, gto_solver::StrategyInfo>> position_strategy_infos;
+            // Store strategies per position using StrategyInfo
+            std::map<std::string, std::map<std::string, gto_solver::StrategyInfo>> position_strategy_infos;
 
-        // Create the base initial state once for context (street, board)
-        gto_solver::GameState initial_state_context(num_players, initial_stack, ante_size, 0); // BTN=0 is arbitrary for context
+            // Create a base state for context (street, board) - BTN=0 is arbitrary
+            // This state is ONLY used to provide street/board context to the InfoSet constructor
+            gto_solver::GameState context_state(num_players, initial_stack, ante_size, 0);
 
-        for (const auto& pos_pair : position_map) {
-            const std::string& pos_name = pos_pair.first;
-            int player_index = pos_pair.second;
+            for (const auto& pos_pair : position_map) {
+                const std::string& pos_name = pos_pair.first;
+                int player_index = pos_pair.second;
 
-            spdlog::info("Extracting RFI strategy for {} (Player {})", pos_name, player_index);
+                spdlog::info("Extracting RFI strategy for {} (Player {})", pos_name, player_index);
 
-            std::map<std::string, gto_solver::StrategyInfo> current_pos_strategy_info;
-            for (const std::string& hand_str_internal : all_hands_str) {
-                 if (hand_str_internal.length() != 4) continue;
-                std::vector<gto_solver::Card> hand_vec = {hand_str_internal.substr(0, 2), hand_str_internal.substr(2, 2)};
-                std::vector<gto_solver::Card> sorted_hand_for_key = hand_vec;
-                std::sort(sorted_hand_for_key.begin(), sorted_hand_for_key.end());
+                // --- Manually construct the expected RFI history string ---
+                std::string rfi_history = "s/b/"; // Commencer par les blindes postées
+                int button_pos_for_sim = 0; // Assume BTN=0 for consistency
+                int first_actor = (num_players == 2) ? 0 : 3; // SB in HU, UTG in 6max (assuming BTN=0)
+                int players_before = 0;
+                int current_p = first_actor;
+                while(current_p != player_index) {
+                     if (players_before >= num_players) { spdlog::error("Infinite loop detected..."); break; }
+                     players_before++;
+                     current_p = (current_p + 1) % num_players;
+                }
+                for (int i = 0; i < players_before; ++i) { rfi_history += "f/"; }
+                // --- END RFI History Construction ---
 
-                // Use the new InfoSet constructor for extraction:
-                std::string history = ""; // RFI history is empty
-                gto_solver::InfoSet infoset(sorted_hand_for_key, history, initial_state_context, player_index);
-                const std::string& infoset_key = infoset.get_key();
+                // --- DEBUG LOGGING for RFI History ---
+                spdlog::info("  Generated RFI History for {}: '{}'", pos_name, rfi_history);
 
-                // Use the new function to get strategy and actions
-                gto_solver::StrategyInfo strat_info = cfr_engine.get_strategy_info(infoset_key);
 
-                std::string canonical_hand_str = format_hand_string(hand_vec);
-                current_pos_strategy_info[canonical_hand_str] = strat_info;
+                std::map<std::string, gto_solver::StrategyInfo> current_pos_strategy_info;
+                for (const std::string& hand_str_internal : all_hands_str) {
+                     if (hand_str_internal.length() != 4) continue;
+                    std::vector<gto_solver::Card> hand_vec = {hand_str_internal.substr(0, 2), hand_str_internal.substr(2, 2)};
+                    std::vector<gto_solver::Card> sorted_hand_for_key = hand_vec;
+                    std::sort(sorted_hand_for_key.begin(), sorted_hand_for_key.end());
+
+                    // Create the InfoSet using the constructor that takes the specific components:
+                    gto_solver::InfoSet infoset(sorted_hand_for_key, rfi_history, context_state, player_index); // Use manually constructed history
+                    const std::string& infoset_key = infoset.get_key();
+
+                    // Use the new function to get strategy and actions
+                    gto_solver::StrategyInfo strat_info = cfr_engine.get_strategy_info(infoset_key);
+
+                    std::string canonical_hand_str = format_hand_string(hand_vec);
+                    current_pos_strategy_info[canonical_hand_str] = strat_info;
+
+                    // --- DEBUG LOGGING for specific hands ---
+                    if (pos_name == "UTG" && (canonical_hand_str == "AA" || canonical_hand_str == "72o" || canonical_hand_str == "KQs")) { // Added KQs
+                         // Log the key directly from the object
+                         spdlog::info("  Debug {}: Hand={}, Key={}", pos_name, canonical_hand_str, infoset.get_key()); // Use info level for visibility
+                         if (strat_info.found) {
+                              std::stringstream ss;
+                              if (strat_info.actions.size() == strat_info.strategy.size()) {
+                                   for(size_t i=0; i<strat_info.actions.size(); ++i) {
+                                        ss << strat_info.actions[i] << "=" << std::fixed << std::setprecision(4) << strat_info.strategy[i] << " ";
+                                   }
+                              } else {
+                                   ss << "ACTION/STRATEGY SIZE MISMATCH!";
+                              }
+                              spdlog::info("    Strategy: {}", ss.str());
+                         } else {
+                              spdlog::info("    Strategy: Not Found");
+                         }
+                    }
+                    // --- END DEBUG LOGGING ---
+                }
+                position_strategy_infos[pos_name] = current_pos_strategy_info;
+
+                // Display grid for this position using the collected StrategyInfo map
+                display_strategy_grid(pos_name, current_pos_strategy_info);
             }
-            position_strategy_infos[pos_name] = current_pos_strategy_info;
 
-            // Display grid for this position using the collected StrategyInfo map
-            display_strategy_grid(pos_name, current_pos_strategy_info);
-        }
+            // --- Export to JSON if filename provided ---
+            if (!json_export_file.empty()) {
+                export_strategies_to_json(json_export_file, position_strategy_infos);
+            }
+        } // End if (!position_map.empty())
 
-        // --- Export to JSON if filename provided ---
-        if (!json_export_file.empty()) {
-            export_strategies_to_json(json_export_file, position_strategy_infos);
-        }
-
-
-    } catch (const std::exception& e) {
+    } catch (const std::exception& e) { // Catch block for main try
         spdlog::error("Exception caught during execution: {}", e.what());
         return 1;
-    } catch (...) {
+    } catch (...) { // Catch-all block
         spdlog::error("Unknown exception caught during execution.");
         return 1;
-    }
+    } // Added missing closing brace for main try block
 
     spdlog::info("GTO Solver finished successfully.");
     return 0;

@@ -49,6 +49,8 @@ Ce document décrit les étapes de développement prévues pour le solver GTO de
         *   [ ] **Conditionner/Supprimer `all_in` préflop** pour stacks > ~40bb dans les scénarios RFI et potentiellement vs RFI.
         *   [ ] Ajouter un sizing de 4Bet non All-in (ex: 2.5x). *(Déjà fait dans `8c1cb33`)*.
         *   [ ] Ajouter des sizings postflop (ex: 25% pot, Overbet 133%, petit raise ~1.8x-2.2x).
+        *   [x] **(B-01 Corrigé)** `get_action_amount` ne rejette plus les open-raises quand `amount_to_call == 0`.
+        *   [x] **(B-02 Corrigé)** L'affichage de la grille dans `main.cpp` marque correctement "R" pour les actions "bet" et "open".
         *   [ ] **(Plus tard) Refactoriser** pour utiliser `enum class ActionType` + `struct ActionSpec` au lieu de strings.
     *   **⚠️ P2 : Incohérence `legal_actions` ↔ Node :**
         *   [ ] **Solution à court terme :** Dans `cfr_plus_recursive`, *après* avoir trouvé/créé le nœud, **vérifier** si `node_ptr->legal_actions` correspond à `legal_actions_str` calculé actuellement. Si différent, logger un warning critique et potentiellement arrêter/ignorer ce chemin, car la stratégie stockée n'est pas valide pour les actions actuelles.
