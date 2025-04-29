@@ -90,7 +90,8 @@ TEST_F(GameStateTest, ApplyActionCheckInvalid) {
     Action check_action;
     check_action.type = Action::Type::CHECK;
     check_action.player_index = 0; // Player 0 (SB) acts
-    EXPECT_THROW(state_hu.apply_action(check_action), std::logic_error);
+    // The function throws std::runtime_error, so the test should expect that.
+    EXPECT_THROW(state_hu.apply_action(check_action), std::runtime_error);
 }
 
 TEST_F(GameStateTest, ApplyActionBBRaiseCall) {

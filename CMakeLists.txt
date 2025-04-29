@@ -21,12 +21,9 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/HenryRLee/PokerHandEvaluator # Corrected username
   # GIT_TAG        1.4.1 # Removed tag, fetching default branch (main)
 )
-FetchContent_GetProperties(phevaluator) # Get properties (like SOURCE_DIR)
-if(NOT phevaluator_POPULATED)
-  FetchContent_Populate(phevaluator) # Download the source only
-  message(STATUS "Populated phevaluator source in ${phevaluator_SOURCE_DIR}")
-endif()
+FetchContent_MakeAvailable(phevaluator) # Use MakeAvailable instead of Populate
 # Explicitly add the subdirectory containing the library's CMakeLists.txt
+# This might not be needed if MakeAvailable handles it, but keep for safety if pheval target isn't found otherwise.
 add_subdirectory(${phevaluator_SOURCE_DIR}/cpp ${phevaluator_BINARY_DIR})
 # --- End Fetch PokerHandEvaluator ---
 

@@ -117,9 +117,10 @@ void display_strategy_grid(
                                     else if (action == "call") display_char = 'C';
                                     else if (action == "check") display_char = 'K';
                                     else if (action == "all_in") display_char = 'A';
-                                    else if (action.find("raise") != std::string::npos) display_char = 'R'; // Keep R for raise
-                                    else if (action.find("bet") != std::string::npos) display_char = 'R'; // Marquer les bets comme R aussi
-                                    else if (action.find("open") != std::string::npos) display_char = 'R'; // Marquer les open comme R aussi
+                                    else if (action.find("raise") != std::string::npos ||
+                                             action.find("bet") != std::string::npos ||
+                                             action.find("open") != std::string::npos ||
+                                             action.find("iso") != std::string::npos) display_char = 'R'; // Marquer raise/bet/open/iso comme R
                                     else display_char = '?'; // Unknown action format
                                } else { display_char = '-'; } // Strategy likely empty or all zeros
                          }
@@ -129,9 +130,10 @@ void display_strategy_grid(
                         if (action == "call") display_char = 'C';
                         else if (action == "check") display_char = 'K';
                         else if (action == "all_in") display_char = 'A';
-                        else if (action.find("raise") != std::string::npos) display_char = 'R'; // Keep R for raise
-                        else if (action.find("bet") != std::string::npos) display_char = 'R'; // Marquer les bets comme R aussi
-                        else if (action.find("open") != std::string::npos) display_char = 'R'; // Marquer les open comme R aussi
+                        else if (action.find("raise") != std::string::npos ||
+                                 action.find("bet") != std::string::npos ||
+                                 action.find("open") != std::string::npos ||
+                                 action.find("iso") != std::string::npos) display_char = 'R'; // Marquer raise/bet/open/iso comme R
                         else display_char = '?'; // Unknown action format
                     }
                 } else if (info.found && !info.strategy.empty()) {
@@ -195,31 +197,41 @@ void export_strategies_to_json(
 
 
 // Function to parse command line arguments (simple version)
-// Added checkpoint parameters
-void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& initial_stack, int& ante_size, int& num_threads, std::string& save_file, int& checkpoint_interval, std::string& load_file, std::string& json_export_file) { // Added json export file
+// Note: This version COMPLETELY IGNORES --loglevel. It's handled manually before logging setup.
+void parse_args(int argc, char* argv[], int& iterations, int& num_players, int& initial_stack, int& ante_size, int& num_threads, std::string& save_file, int& checkpoint_interval, std::string& load_file, std::string& json_export_file) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-i" || arg == "--iterations") && i + 1 < argc) {
-            try { iterations = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid iterations value."); }
+            try { iterations = std::stoi(argv[++i]); } catch (...) { /* Ignored */ }
         } else if ((arg == "-n" || arg == "--num_players") && i + 1 < argc) {
-             try { num_players = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid num_players value."); }
+             try { num_players = std::stoi(argv[++i]); } catch (...) { /* Ignored */ }
         } else if ((arg == "-s" || arg == "--stack") && i + 1 < argc) {
-             try { initial_stack = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid stack value."); }
+             try { initial_stack = std::stoi(argv[++i]); } catch (...) { /* Ignored */ }
         } else if ((arg == "-a" || arg == "--ante") && i + 1 < argc) {
-             try { ante_size = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid ante value."); }
+             try { ante_size = std::stoi(argv[++i]); } catch (...) { /* Ignored */ }
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
-             try { num_threads = std::stoi(argv[++i]); } catch (...) { spdlog::warn("Invalid threads value."); num_threads = 0; }
+             try { num_threads = std::stoi(argv[++i]); } catch (...) { num_threads = 0; /* Ignored */ }
         } else if ((arg == "--save") && i + 1 < argc) {
             save_file = argv[++i];
         } else if ((arg == "--interval") && i + 1 < argc) {
-             try { checkpoint_interval = std::stoi(argv[++i]); if (checkpoint_interval < 0) checkpoint_interval = 0; } catch (...) { spdlog::warn("Invalid interval value."); checkpoint_interval = 0; }
+             try { checkpoint_interval = std::stoi(argv[++i]); if (checkpoint_interval < 0) checkpoint_interval = 0; } catch (...) { checkpoint_interval = 0; /* Ignored */ }
         } else if ((arg == "--load") && i + 1 < argc) {
             load_file = argv[++i];
         } else if ((arg == "--json") && i + 1 < argc) { // Added JSON export argument
             json_export_file = argv[++i];
-        }
-         else {
-            spdlog::warn("Unknown or incomplete argument: {}", arg);
+        } else if (arg == "--loglevel" && i + 1 < argc) {
+             // Skip --loglevel and its value if encountered
+             i++;
+        } else {
+             // Log unknown arguments *only if* spdlog is initialized (which it will be when this is called)
+             // Avoid logging the value part of --loglevel if it happens to be the last argument
+             if (arg != "--loglevel") {
+                // Check if the previous argument was --loglevel to avoid warning about its value
+                bool prev_was_loglevel = (i > 1 && std::string(argv[i-1]) == "--loglevel");
+                if (!prev_was_loglevel) {
+                    spdlog::warn("Unknown or incomplete argument: {}", arg);
+                }
+             }
         }
     }
 }
@@ -236,29 +248,37 @@ int main(int argc, char* argv[]) { // Modified main signature
     int checkpoint_interval = 0; // Default: no periodic saving (only final if save_file specified)
     std::string load_file = ""; // Default: no loading
     std::string json_export_file = ""; // Default: no JSON export
+    // Log level will be hardcoded to trace below
 
     // --- Setup Logging ---
+    // Forcing log level to trace to bypass argument parsing issues
     try {
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        console_sink->set_level(spdlog::level::info); // Set level to info
-        // Set level to debug to see debug logs:
-        // console_sink->set_level(spdlog::level::debug);
-        spdlog::logger logger("gto_solver_logger", {console_sink});
-        logger.set_level(spdlog::level::info); // Set logger level to info
-        // logger.set_level(spdlog::level::debug); // Set logger level to debug
-        logger.flush_on(spdlog::level::info);
-        spdlog::set_default_logger(std::make_shared<spdlog::logger>(logger));
-        spdlog::info("Logging initialized.");
+        console_sink->set_level(spdlog::level::trace); // Sink allows everything
+
+        auto logger = std::make_shared<spdlog::logger>("gto_solver_logger", console_sink);
+        logger->flush_on(spdlog::level::trace);
+
+        spdlog::set_default_logger(logger);
+        // FORCE log level to trace
+        spdlog::level::level_enum log_level = spdlog::level::trace; // Hardcoded level
+        spdlog::set_level(log_level);
+
+        spdlog::info("Logging initialized. Level FORCED to: {}", spdlog::level::to_string_view(log_level));
+        spdlog::debug("Debug logging enabled."); // Will show if level <= debug
+        spdlog::trace("Trace logging enabled."); // Will show if level <= trace
 
     } catch (const spdlog::spdlog_ex& ex) {
         std::cerr << "Log initialization failed: " << ex.what() << std::endl;
         return 1;
     }
-
     spdlog::info("Starting GTO Solver");
 
-    // --- Parse Arguments ---
-    parse_args(argc, argv, num_iterations, num_players, initial_stack, ante_size, num_threads, save_file, checkpoint_interval, load_file, json_export_file); // Pass json_export_file
+    // --- Parse All Other Arguments ---
+    // This call will now ignore --loglevel and its value
+    parse_args(argc, argv, num_iterations, num_players, initial_stack, ante_size, num_threads, save_file, checkpoint_interval, load_file, json_export_file);
+
+    // --- Log Configuration ---
     spdlog::info("Configuration - Iterations: {}, Players: {}, Stack: {}, Ante: {}, Threads: {}",
                  num_iterations, num_players, initial_stack, ante_size, (num_threads <= 0 ? "Auto" : std::to_string(num_threads)));
     if (!load_file.empty()) spdlog::info("Load Checkpoint: {}", load_file);
@@ -309,22 +329,27 @@ int main(int argc, char* argv[]) { // Modified main signature
 
                 spdlog::info("Extracting RFI strategy for {} (Player {})", pos_name, player_index);
 
-                // --- Manually construct the expected RFI history string ---
-                std::string rfi_history = "s/b/"; // Commencer par les blindes postées
+                // --- History String for RFI ---
+                // Correction: Use an empty history string for RFI spots, as this matches
+                // the GameState's history before the first action is taken.
+                // The previous manual construction ("s/b/f/...") caused a mismatch.
+                std::string rfi_history = "";
+                // We still need to know how many players folded *before* this position
+                // to ensure we are querying the correct RFI spot conceptually,
+                // even though the history string itself is empty for the key.
                 int button_pos_for_sim = 0; // Assume BTN=0 for consistency
                 int first_actor = (num_players == 2) ? 0 : 3; // SB in HU, UTG in 6max (assuming BTN=0)
-                int players_before = 0;
-                int current_p = first_actor;
-                while(current_p != player_index) {
-                     if (players_before >= num_players) { spdlog::error("Infinite loop detected..."); break; }
-                     players_before++;
-                     current_p = (current_p + 1) % num_players;
+                int players_folded_before = 0;
+                int current_p_check = first_actor;
+                while(current_p_check != player_index) {
+                     if (players_folded_before >= num_players) { spdlog::error("Infinite loop detected in RFI check..."); break; }
+                     players_folded_before++;
+                     current_p_check = (current_p_check + 1) % num_players;
                 }
-                for (int i = 0; i < players_before; ++i) { rfi_history += "f/"; }
-                // --- END RFI History Construction ---
+                // --- END History String ---
 
                 // --- DEBUG LOGGING for RFI History ---
-                spdlog::info("  Generated RFI History for {}: '{}'", pos_name, rfi_history);
+                spdlog::info("  Using RFI History for {}: '{}' (Players folded before: {})", pos_name, rfi_history, players_folded_before);
 
 
                 std::map<std::string, gto_solver::StrategyInfo> current_pos_strategy_info;
@@ -335,10 +360,11 @@ int main(int argc, char* argv[]) { // Modified main signature
                     std::sort(sorted_hand_for_key.begin(), sorted_hand_for_key.end());
 
                     // Create the InfoSet using the constructor that takes the specific components:
-                    gto_solver::InfoSet infoset(sorted_hand_for_key, rfi_history, context_state, player_index); // Use manually constructed history
+                    // Use the corrected (empty) history string.
+                    gto_solver::InfoSet infoset(sorted_hand_for_key, rfi_history, context_state, player_index);
                     const std::string& infoset_key = infoset.get_key();
 
-                    // Use the new function to get strategy and actions
+                    // Use the function to get strategy and actions
                     gto_solver::StrategyInfo strat_info = cfr_engine.get_strategy_info(infoset_key);
 
                     std::string canonical_hand_str = format_hand_string(hand_vec);
@@ -350,16 +376,18 @@ int main(int argc, char* argv[]) { // Modified main signature
                          spdlog::info("  Debug {}: Hand={}, Key={}", pos_name, canonical_hand_str, infoset.get_key()); // Use info level for visibility
                          if (strat_info.found) {
                               std::stringstream ss;
+                              // Correctly associate strategy probabilities with action names
                               if (strat_info.actions.size() == strat_info.strategy.size()) {
-                                   for(size_t i=0; i<strat_info.actions.size(); ++i) {
+                                   for(size_t i = 0; i < strat_info.actions.size(); ++i) {
+                                        // Use the action name from strat_info.actions
                                         ss << strat_info.actions[i] << "=" << std::fixed << std::setprecision(4) << strat_info.strategy[i] << " ";
                                    }
                               } else {
-                                   ss << "ACTION/STRATEGY SIZE MISMATCH!";
+                                   ss << "ACTION/STRATEGY SIZE MISMATCH! (Actions: " << strat_info.actions.size() << ", Strategy: " << strat_info.strategy.size() << ")";
                               }
-                              spdlog::info("    Strategy: {}", ss.str());
+                              spdlog::info("    Strategy: {}", ss.str().empty() ? "No actions/strategy found?" : ss.str());
                          } else {
-                              spdlog::info("    Strategy: Not Found");
+                              spdlog::info("    Strategy: Not Found in NodeMap");
                          }
                     }
                     // --- END DEBUG LOGGING ---

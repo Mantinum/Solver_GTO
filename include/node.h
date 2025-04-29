@@ -12,6 +12,9 @@
 #include <vector> // For std::vector
 #include "action_abstraction.h" // Include ActionSpec definition
 
+#include "spdlog/spdlog.h" // Include spdlog for logging within Node methods
+#include "spdlog/fmt/bundled/format.h" // Include fmt for logging vectors
+
 
 namespace gto_solver {
 
@@ -60,16 +63,30 @@ struct Node {
             total_strategy_sum += sum;
         }
 
+        // --- DEBUG: Log strategy sum and normalization ---
+        spdlog::debug("  get_average_strategy: TotalStrategySum = {}", total_strategy_sum);
+        // --- END DEBUG ---
+
         if (total_strategy_sum > 0) {
             for (size_t i = 0; i < strategy_sum.size(); ++i) {
                 avg_strategy[i] = strategy_sum[i] / total_strategy_sum;
             }
+             // --- DEBUG: Log strategy before final normalization (if any) ---
+             // Note: This is already normalized if total_strategy_sum > 0
+             // spdlog::debug("  get_average_strategy: Pre-Norm Avg Strategy: [{}]", fmt::join(avg_strategy, ", "));
+             // --- END DEBUG ---
         } else {
             if (!strategy_sum.empty()) { // Avoid division by zero if size is 0
                 double uniform_prob = 1.0 / strategy_sum.size();
                 std::fill(avg_strategy.begin(), avg_strategy.end(), uniform_prob);
+                 spdlog::debug("  get_average_strategy: Using uniform strategy due to zero sum."); // DEBUG
+            } else {
+                 spdlog::debug("  get_average_strategy: Strategy sum is zero and vector is empty."); // DEBUG
             }
         }
+        // --- DEBUG: Log final returned strategy ---
+        // spdlog::debug("  get_average_strategy: Final Avg Strategy: [{}]", fmt::join(avg_strategy, ", "));
+        // --- END DEBUG ---
         return avg_strategy;
     }
 };

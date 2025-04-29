@@ -27,17 +27,24 @@ public:
     // Generate a unique string key for this infoset (useful for map keys)
     const std::string& get_key() const; // Key is now generated at construction
 
+    // Allow setting the hand after construction (for extraction)
+    // This will regenerate the key based on the new hand.
+    void set_hand(const std::vector<Card>& hand);
+
     // Equality operator for map comparisons (compares keys)
     bool operator==(const InfoSet& other) const;
 
 private:
-    // Store necessary components directly or generate key immediately
-    // std::vector<Card> private_hand_; // No longer stored directly
-    // std::string action_history_; // No longer stored directly
-    std::string key_; // Key generated at construction and stored
+    // Store components needed to regenerate the key when hand changes
+    std::vector<Card> private_hand_; // Store the hand
+    std::string action_history_;     // Store the history used for the key
+    Street street_;                  // Store the street used for the key
+    std::vector<Card> board_;        // Store the board used for the key
+    int player_index_;               // Store the player index used for the key
+    std::string key_;                // The generated key
 
-    // Key generation logic moved to constructor or a helper called by it
-    // void generate_key(const GameState& current_state, int player_index); // Made private or part of constructor
+    // Helper function to generate the key from stored components
+    void generate_key();
 };
 
 // Hash function for InfoSet to allow usage in std::unordered_map

@@ -10,3 +10,75 @@ CMakePresets.json
 
 # VS Code specific
 .vscode/
+
+# CMake generated files
+    CMakeCache.txt
+    CMakeFiles/
+    cmake_install.cmake
+    compile_commands.json
+    Makefile
+    CTestTestfile.cmake
+    Testing/
+
+    # Build artifacts
+    *.o
+    *.a
+    *.so
+    *.dylib
+    *.dll
+    *.exe
+    *.out
+
+    # Executables (adjust if your executable names differ)
+    gto_solver
+    *_test
+    action_abstraction_fix_test
+    c_example
+    cpp_example
+    evaluator*_standalone_example
+    omaha_example
+    plo*_example
+    benchmark_phevaluator
+    unit_tests*
+    benchmark*test
+    spec_arg*test
+    *gtest
+    options_test
+    basic_test
+    repetitions_test
+    diagnostics_test
+    skip_with_error_test
+    donotoptimize_test
+    fixture_test
+    register_benchmark_test
+    map_test
+    multiple_ranges_test
+    args_product_test
+    link_main_test
+    reporter_output_test
+    templated_fixture_test
+    user_counters_test
+    user_counters_tabular_test
+    user_counters_thousands_test
+    perf_counters_test
+    internal_threading_test
+    report_aggregates_only_test
+    display_aggregates_only_test
+    memory_manager_test
+    cxx03_test
+    complexity_test
+
+    # Dependencies managed by CMake (FetchContent or ExternalProject)
+    _deps/
+
+    # Build directory (if using out-of-source builds, common practice)
+    Build/
+
+    # Library directory (if CMake installs libs there)
+    lib/
+
+    # IDE specific files
+    *.suo
+    *.user
+    *.userosscache
+    *.sln.docstates

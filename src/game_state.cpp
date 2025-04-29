@@ -379,8 +379,17 @@ void GameState::advance_to_next_street() {
     spdlog::trace("Advancing to street {}.", static_cast<int>(current_street_));
     reset_bets_for_new_street();
 
-    current_player_index_ = (button_position_ + 1) % num_players_;
+    // Determine the first player to act on the new street
+    if (num_players_ == 2) {
+        // In Heads-Up, the button (SB) acts first postflop
+        current_player_index_ = button_position_;
+    } else {
+        // In multiway, player left of the button acts first
+        current_player_index_ = (button_position_ + 1) % num_players_;
+    }
+
     int initial_actor = current_player_index_;
+    // Skip players who are folded or all-in
     while(player_folded_[current_player_index_] || player_all_in_[current_player_index_]) {
          current_player_index_ = (current_player_index_ + 1) % num_players_;
          if (current_player_index_ == initial_actor) {

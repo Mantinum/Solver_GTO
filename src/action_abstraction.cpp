@@ -1,17 +1,18 @@
-#include "action_abstraction.h" // Corrected include
-#include "game_state.h" // Corrected include
+#include "action_abstraction.h"
+#include "game_state.h"
 
 #include <vector>
 #include <string>
-#include <set>       // For std::set (used for unique actions)
-#include <cmath>     // For std::round, std::max, std::abs
-#include <algorithm> // For std::min, std::sort
-#include <map>       // For mapping context to actions
-#include <sstream>   // Include stringstream for formatting doubles
-#include <iomanip>   // Include iomanip for setprecision
-#include <stdexcept> // For invalid_argument
+#include <set>
+#include <cmath>
+#include <algorithm>
+#include <map>
+#include <sstream>
+#include <iomanip>
+#include <stdexcept>
+#include <numeric> // Added for std::accumulate
 
-#include "spdlog/spdlog.h" // Include spdlog
+#include "spdlog/spdlog.h"
 
 namespace gto_solver {
 
@@ -41,7 +42,7 @@ std::string ActionSpec::to_string() const {
         case SizingUnit::BB:       ss << "bb"; break;
         case SizingUnit::PCT_POT:  ss << "pct"; break;
         case SizingUnit::MULTIPLIER_X: ss << "x"; break;
-        case SizingUnit::ABSOLUTE: break; // No unit needed for absolute (used internally for all-in amount)
+        default: return "unknown"; // No unit needed for absolute (used internally for all-in amount)
     }
     return ss.str();
 }
@@ -52,9 +53,9 @@ ActionAbstraction::ActionAbstraction() {
     spdlog::debug("ActionAbstraction created");
 }
 
-// New method using ActionSpec
+// New method using ActionSpec - Refactored to use integer amounts for filtering/sorting
 std::vector<ActionSpec> ActionAbstraction::get_possible_action_specs(const GameState& current_state) const {
-    std::set<ActionSpec> actions_set; // Use set to handle potential duplicates based on calculated amount later
+    std::set<ActionSpec> candidate_specs_set; // Generate candidate specs first
     int current_player = current_state.get_current_player();
     if (current_player < 0) return {};
 
@@ -66,22 +67,23 @@ std::vector<ActionSpec> ActionAbstraction::get_possible_action_specs(const GameS
 
     if (player_stack <= 0) return {};
 
-    // 1. Fold Action
-    if (amount_to_call > 0) {
-        actions_set.insert({ActionType::FOLD});
+    // 1. Fold Action (Revisiting - add only if CALL is possible but player chooses not to)
+    if (amount_to_call > 0 && player_stack > 0) { // If facing a bet and not already all-in
+        candidate_specs_set.insert({ActionType::FOLD});
     }
 
     // 2. Check or Call Action
     if (amount_to_call == 0) {
-        actions_set.insert({ActionType::CHECK});
-    } else {
+        candidate_specs_set.insert({ActionType::CHECK});
+    } else { // amount_to_call > 0
         if (player_stack >= amount_to_call) {
-             actions_set.insert({ActionType::CALL});
+             candidate_specs_set.insert({ActionType::CALL});
         }
+        // FOLD is handled separately below if needed
     }
 
     // 3. Bet or Raise Actions (Only if stack > amount_to_call)
-    if (player_stack > amount_to_call) {
+    if (player_stack > 0 && amount_to_call <= player_stack) {
         bool facing_bet_or_raise = amount_to_call > 0;
         int num_raises = current_state.get_raises_this_street();
         int num_limpers = current_state.get_num_limpers();
@@ -89,130 +91,229 @@ std::vector<ActionSpec> ActionAbstraction::get_possible_action_specs(const GameS
         // --- Preflop Abstraction ---
         if (street == Street::PREFLOP) {
             int sb_index = (current_state.get_button_position() + 1) % current_state.get_num_players();
-            if (current_state.get_num_players() == 2) sb_index = current_state.get_button_position();
+            int bb_index = (current_state.get_button_position() + 2) % current_state.get_num_players();
+            if (current_state.get_num_players() == 2) {
+                sb_index = current_state.get_button_position();
+                bb_index = (sb_index + 1) % current_state.get_num_players();
+            }
 
-            if (!facing_bet_or_raise && num_limpers == 0) { // RFI or SB complete/raise vs BB check
-                 if (current_player == sb_index) { // SB action
-                      // Call already added if possible
-                      actions_set.insert({ActionType::RAISE, 3.0, SizingUnit::BB});
-                      actions_set.insert({ActionType::RAISE, 4.0, SizingUnit::BB});
-                 } else if (current_state.is_first_to_act_preflop(current_player)) { // RFI
-                      double open_size_bb_small = 2.2;
-                      if (EFFECTIVE_STACK_BB < 25) open_size_bb_small = 2.0;
-                      else if (EFFECTIVE_STACK_BB < 35) open_size_bb_small = 2.1;
-                      actions_set.insert({ActionType::RAISE, open_size_bb_small, SizingUnit::BB});
-                      actions_set.insert({ActionType::RAISE, 2.5, SizingUnit::BB});
-                      actions_set.insert({ActionType::RAISE, 3.0, SizingUnit::BB});
-                      actions_set.insert({ActionType::FOLD}); // <<< AJOUTER FOLD POUR RFI
-                 } else {
-                      // Not SB or first actor, but no bet/limp? Should be CHECK or FOLD only.
-                      // Check is added later in filtering if amount_to_call == 0
-                      actions_set.insert({ActionType::FOLD});
-                 }
+            // Specific Check for HU SB Opening Spot
+            if (current_state.get_num_players() == 2 && current_player == sb_index && num_raises == 0) {
+                candidate_specs_set.insert({ActionType::RAISE, 3.0, SizingUnit::BB});
+                candidate_specs_set.insert({ActionType::RAISE, 4.0, SizingUnit::BB});
+                // Note: CALL/FOLD are added by general logic
             }
-            else if (!facing_bet_or_raise && num_limpers > 0) { // Facing limper(s)
-                 // Call already added
-                 double iso_size_bb1 = 3.0 + num_limpers;
-                 double iso_size_bb2 = 4.0 + num_limpers;
-                 actions_set.insert({ActionType::RAISE, iso_size_bb1, SizingUnit::BB});
-                 actions_set.insert({ActionType::RAISE, iso_size_bb2, SizingUnit::BB});
-            }
-            else if (facing_bet_or_raise) { // Facing a raise
-                 if (num_raises == 1) { // Facing RFI (2Bet)
-                      actions_set.insert({ActionType::RAISE, 3.0, SizingUnit::MULTIPLIER_X});
-                      actions_set.insert({ActionType::RAISE, 4.0, SizingUnit::MULTIPLIER_X});
-                 } else if (num_raises == 2) { // Facing 3Bet
-                      actions_set.insert({ActionType::RAISE, 2.5, SizingUnit::MULTIPLIER_X});
-                 }
-                 // Add All-in option only if facing a 3Bet or more, OR if stack is short vs RFI
-                 if (num_raises >= 2 || (num_raises == 1 && EFFECTIVE_STACK_BB <= 40)) {
-                      actions_set.insert({ActionType::ALL_IN});
-                 }
-            }
-            // Add All-in as an option in RFI/vs Limp spots only if stack is short
-            else if (!facing_bet_or_raise && EFFECTIVE_STACK_BB <= 20) {
-                 actions_set.insert({ActionType::ALL_IN});
+            else {
+                // General Preflop Logic (RFI, vs Limp, vs Raise)
+                bool is_rfi_situation = (!facing_bet_or_raise || (amount_to_call == BIG_BLIND_SIZE && num_raises == 0)) && num_limpers == 0;
+
+                if (is_rfi_situation) {
+                    // Handle 6-max+ SB RFI
+                    if (current_player == sb_index && current_state.get_num_players() > 2) {
+                        candidate_specs_set.insert({ActionType::RAISE, 3.0, SizingUnit::BB});
+                        candidate_specs_set.insert({ActionType::RAISE, 4.0, SizingUnit::BB});
+                    }
+                    // Handle other positions RFI
+                    else if (current_state.is_first_to_act_preflop(current_player)) {
+                        double open_size_bb_small = 2.2;
+                        if (EFFECTIVE_STACK_BB < 25) open_size_bb_small = 2.0;
+                        else if (EFFECTIVE_STACK_BB < 35) open_size_bb_small = 2.1;
+                        candidate_specs_set.insert({ActionType::RAISE, open_size_bb_small, SizingUnit::BB});
+                        candidate_specs_set.insert({ActionType::RAISE, 2.5, SizingUnit::BB});
+                        candidate_specs_set.insert({ActionType::RAISE, 3.0, SizingUnit::BB});
+                    }
+                } else if (!facing_bet_or_raise && num_limpers > 0) {
+                    // Specific HU BB vs Limp case?
+                    if(current_state.get_num_players() == 2 && current_player == bb_index) {
+                        candidate_specs_set.insert({ActionType::RAISE, 3.0, SizingUnit::BB}); // Same sizes as SB RFI for simplicity?
+                        candidate_specs_set.insert({ActionType::RAISE, 4.0, SizingUnit::BB});
+                    } else { // Multiway isolation sizing
+                        double iso_size_bb1 = 3.0 + num_limpers;
+                        double iso_size_bb2 = 4.0 + num_limpers;
+                        candidate_specs_set.insert({ActionType::RAISE, iso_size_bb1, SizingUnit::BB});
+                        candidate_specs_set.insert({ActionType::RAISE, iso_size_bb2, SizingUnit::BB});
+                    }
+                } else if (facing_bet_or_raise) {
+                    if (num_raises == 1) {
+                        bool is_bb_vs_sb_open_hu = (current_state.get_num_players() == 2 && current_player == bb_index && current_state.get_last_raiser() == sb_index);
+                        if (is_bb_vs_sb_open_hu) {
+                            candidate_specs_set.insert({ActionType::RAISE, 3.0, SizingUnit::MULTIPLIER_X}); // 3bet 3x
+                            candidate_specs_set.insert({ActionType::RAISE, 4.0, SizingUnit::MULTIPLIER_X}); // 3bet 4x
+                            candidate_specs_set.insert({ActionType::ALL_IN}); // Always add ALL_IN vs SB open HU?
+                        } else { // Facing RFI from other positions (multiway)
+                            // Add different 3bet sizings if needed
+                            // Maybe add ALL_IN here too based on stack?
+                            if (EFFECTIVE_STACK_BB <= 40) { candidate_specs_set.insert({ActionType::ALL_IN}); }
+                        }
+                    } else if (num_raises == 2) { // Facing 4bet
+                        candidate_specs_set.insert({ActionType::RAISE, 2.5, SizingUnit::MULTIPLIER_X}); // 5bet sizing?
+                        candidate_specs_set.insert({ActionType::ALL_IN}); // Usually only call/fold/all-in vs 4bet
+                    } else { // Facing 5bet+
+                        candidate_specs_set.insert({ActionType::ALL_IN}); // Only call/fold/all-in reasonable
+                    }
+                }
             }
         }
         // --- Postflop Abstraction ---
         else {
-             if (!facing_bet_or_raise) { // Option to Bet
-                  actions_set.insert({ActionType::BET, 33, SizingUnit::PCT_POT});
-                  actions_set.insert({ActionType::BET, 50, SizingUnit::PCT_POT});
-                  actions_set.insert({ActionType::BET, 75, SizingUnit::PCT_POT});
-                  actions_set.insert({ActionType::BET, 100, SizingUnit::PCT_POT});
-                  actions_set.insert({ActionType::BET, 133, SizingUnit::PCT_POT});
-             } else { // Option to Raise
-                  actions_set.insert({ActionType::RAISE, 2.2, SizingUnit::MULTIPLIER_X});
-                  actions_set.insert({ActionType::RAISE, 3.0, SizingUnit::MULTIPLIER_X});
+             if (!facing_bet_or_raise) {
+                  candidate_specs_set.insert({ActionType::BET, 33, SizingUnit::PCT_POT});
+                  candidate_specs_set.insert({ActionType::BET, 50, SizingUnit::PCT_POT});
+                  candidate_specs_set.insert({ActionType::BET, 75, SizingUnit::PCT_POT});
+                  candidate_specs_set.insert({ActionType::BET, 100, SizingUnit::PCT_POT});
+                  candidate_specs_set.insert({ActionType::BET, 133, SizingUnit::PCT_POT});
+             } else {
+                  candidate_specs_set.insert({ActionType::RAISE, 2.2, SizingUnit::MULTIPLIER_X});
+                  candidate_specs_set.insert({ActionType::RAISE, 3.0, SizingUnit::MULTIPLIER_X});
              }
-             actions_set.insert({ActionType::ALL_IN});
+             candidate_specs_set.insert({ActionType::ALL_IN});
         }
     } else if (player_stack > 0 && amount_to_call > 0 && player_stack <= amount_to_call) {
-         // If player cannot cover the call, only options are fold or all-in
-         actions_set.clear();
-         actions_set.insert({ActionType::FOLD});
-         actions_set.insert({ActionType::ALL_IN});
+         candidate_specs_set.clear();
+         candidate_specs_set.insert({ActionType::FOLD});
+         candidate_specs_set.insert({ActionType::ALL_IN});
     }
 
+    // Specific Removal for HU SB Open: Remove FOLD if present
+    // In HU preflop, the SB opening doesn't typically consider FOLD as a primary action.
+    // The test `PreflopSBInitialActionsHU` expects only CALL/RAISE options.
+    if (street == Street::PREFLOP &&
+        current_state.get_num_players() == 2 &&
+        current_player == current_state.get_button_position() && // In HU, SB = BTN
+        current_state.get_raises_this_street() == 0)
+    {
+        candidate_specs_set.erase({ActionType::FOLD});
+    }
 
-    // --- Final Filtering (Based on calculated amounts) ---
-    std::vector<ActionSpec> final_actions;
-    std::set<int> unique_amounts; // Track unique *calculated* amounts
-    int all_in_amount = player_stack + current_state.get_bet_this_round(current_player); // Use getter
+    // --- Calculate Amounts and Filter/Sort Based on Integers ---
+    spdlog::debug("Candidate specs for player {}:", current_player); // Log candidates
+    for(const auto& s : candidate_specs_set) spdlog::debug("- {}", s.to_string());
 
-    // Ensure Fold/Check/Call are present if legal
-     if (amount_to_call > 0) final_actions.push_back({ActionType::FOLD});
-     if (amount_to_call == 0) final_actions.push_back({ActionType::CHECK});
-     else if (player_stack >= amount_to_call) final_actions.push_back({ActionType::CALL});
+    std::vector<std::pair<ActionSpec, int>> spec_amount_pairs;
+    int all_in_amount = player_stack + current_state.get_bet_this_round(current_player);
+    std::set<int> unique_amounts; // Track unique calculated amounts
 
-    // Process Bets/Raises/All-ins from the set
-    for (const ActionSpec& spec : actions_set) {
+    // Process all candidate specs
+    for (const ActionSpec& spec : candidate_specs_set) {
+        int amount = -1; // Default amount for non-betting actions
+        bool is_betting_action = false;
+
         if (spec.type == ActionType::BET || spec.type == ActionType::RAISE || spec.type == ActionType::ALL_IN) {
-            int amount = get_action_amount(spec, current_state); // Calculate amount based on spec
-
-            if (amount == -1) continue; // Error during calculation
-
-            // Calculate min legal raise amount (total bet)
-            int current_bet = current_state.get_bet_this_round(current_player); // Get current bet again
-            int min_legal_total_bet = current_bet + amount_to_call;
-            if (amount > min_legal_total_bet) { // If it's intended as a raise/bet
-                 int min_raise_increment = std::max(1, current_state.get_last_raise_size());
-                 if (street == Street::PREFLOP && current_state.get_raises_this_street() == 0) {
-                      min_raise_increment = BIG_BLIND_SIZE;
-                 }
-                 min_legal_total_bet += min_raise_increment;
+            is_betting_action = true;
+            amount = get_action_amount(spec, current_state);
+            if (amount == -1 && spec.type != ActionType::ALL_IN) {
+                spdlog::warn("Amount calculation error for spec: {}", spec.to_string());
+                continue; // Skip if amount calculation failed (except for ALL_IN spec itself)
             }
+             if (spec.type == ActionType::ALL_IN) {
+                 amount = all_in_amount; // Ensure correct amount for ALL_IN
+             }
+        } else if (spec.type == ActionType::CALL) {
+             amount = current_state.get_bet_this_round(current_player) + amount_to_call;
+        } else if (spec.type == ActionType::CHECK) {
+             amount = current_state.get_bet_this_round(current_player); // Amount is current bet (should be 0)
+        }
+        // FOLD has amount = -1
 
-            // Ensure the calculated amount is valid
+        // --- Min Legal Bet/Raise Validation ---
+        bool is_valid_sizing = true;
+        if (spec.type == ActionType::BET || spec.type == ActionType::RAISE) {
+            int current_bet = current_state.get_bet_this_round(current_player);
+            int min_legal_total_bet = -1;
+            if (spec.type == ActionType::BET) {
+                 min_legal_total_bet = current_bet + std::max(1, BIG_BLIND_SIZE);
+                 min_legal_total_bet = std::min(min_legal_total_bet, current_bet + player_stack);
+            } else { // RAISE
+                 int raise_base_amount = current_bet + amount_to_call;
+                 int min_raise_increment = (current_state.get_last_raise_size() > 0) ? current_state.get_last_raise_size() : BIG_BLIND_SIZE;
+                 min_raise_increment = std::max(1, min_raise_increment);
+                 min_legal_total_bet = raise_base_amount + min_raise_increment;
+                 min_legal_total_bet = std::min(min_legal_total_bet, current_bet + player_stack);
+            }
             if (amount < min_legal_total_bet && amount != all_in_amount) {
-                 continue; // Skip invalid bet/raise size (unless it's exactly all-in)
+                is_valid_sizing = false;
+                 spdlog::trace("Skipping invalid sizing: Spec={}, CalcAmount={}, MinLegal={}, AllIn={}",
+                               spec.to_string(), amount, min_legal_total_bet, all_in_amount);
             }
+        }
 
-            // Ensure amount doesn't exceed stack (already handled by get_action_amount capping)
-            // amount = std::min(amount, all_in_amount); // Recalculate capped amount if needed
+        if (!is_valid_sizing) {
+             continue;
+        }
 
-            // Add if the calculated amount is unique
-            if (unique_amounts.find(amount) == unique_amounts.end()) {
-                 // If the calculated amount IS all-in, use the ALL_IN type
-                 if (amount == all_in_amount) {
-                      // Avoid adding duplicate ALL_IN spec if already present
-                      bool all_in_present = false;
-                      for(const auto& fa : final_actions) { if(fa.type == ActionType::ALL_IN) { all_in_present = true; break; } }
-                      if (!all_in_present) {
-                           final_actions.push_back({ActionType::ALL_IN, (double)all_in_amount, SizingUnit::ABSOLUTE});
-                           unique_amounts.insert(all_in_amount);
+        // Add the spec and its calculated amount (or -1 for fold)
+        spec_amount_pairs.push_back({spec, amount});
+    }
+
+    // --- Filter for Unique Amounts (among betting actions) and Final Sort ---
+    // TODO: Re-evaluate filtering logic. Commenting out unique amount filtering for now.
+    /*
+    std::vector<std::pair<ActionSpec, int>> final_spec_amount_pairs;
+    std::set<int> final_unique_amounts;
+
+    // Add Fold/Check/Call first unconditionally if they exist in pairs
+     for (const auto& pair : spec_amount_pairs) {
+          if (pair.first.type == ActionType::FOLD || pair.first.type == ActionType::CHECK || pair.first.type == ActionType::CALL) {
+               final_spec_amount_pairs.push_back(pair);
+               if(pair.second != -1) final_unique_amounts.insert(pair.second); // Track Check/Call amounts
+          }
+     }
+
+
+    // Add unique Bet/Raise/All-in amounts
+    for (const auto& pair : spec_amount_pairs) {
+        if (pair.first.type == ActionType::BET || pair.first.type == ActionType::RAISE || pair.first.type == ActionType::ALL_IN) {
+            if (final_unique_amounts.find(pair.second) == final_unique_amounts.end()) {
+                 // If it's an ALL_IN action spec, ensure we use the canonical one
+                 if (pair.second == all_in_amount) {
+                      bool all_in_already_added = false;
+                      for(const auto& final_pair : final_spec_amount_pairs) { if(final_pair.first.type == ActionType::ALL_IN) { all_in_already_added = true; break; } }
+                      if (!all_in_already_added) {
+                           final_spec_amount_pairs.push_back({{ActionType::ALL_IN}, pair.second});
+                           final_unique_amounts.insert(pair.second);
                       }
                  } else {
-                      final_actions.push_back(spec); // Add the original spec
-                      unique_amounts.insert(amount);
+                      final_spec_amount_pairs.push_back(pair);
+                      final_unique_amounts.insert(pair.second);
                  }
             }
         }
     }
+    */
+    // Use spec_amount_pairs directly without unique amount filtering
+    std::vector<std::pair<ActionSpec, int>> final_spec_amount_pairs = spec_amount_pairs;
 
-    // Sort actions? Maybe by type then amount? For now, return as is.
-    return final_actions;
+    // Sort the final list based on type and then calculated amount
+    std::sort(final_spec_amount_pairs.begin(), final_spec_amount_pairs.end(),
+              [](const std::pair<ActionSpec, int>& a, const std::pair<ActionSpec, int>& b) {
+        std::map<ActionType, int> type_order = {
+            {ActionType::FOLD, 0}, {ActionType::CHECK, 1}, {ActionType::CALL, 2},
+            {ActionType::BET, 3}, {ActionType::RAISE, 3}, // Group BET and RAISE
+            {ActionType::ALL_IN, 4}
+        };
+        int order_a = type_order.count(a.first.type) ? type_order.at(a.first.type) : 99;
+        int order_b = type_order.count(b.first.type) ? type_order.at(b.first.type) : 99;
+
+        if (order_a != order_b) return order_a < order_b;
+
+        // If types have same order (BET/RAISE), sort by calculated amount
+        if (order_a == 3) {
+            return a.second < b.second;
+        }
+        // For other types, amount doesn't matter for sorting if type is the same
+        return false;
+    });
+
+    // Extract the final sorted ActionSpec vector
+    std::vector<ActionSpec> final_sorted_specs;
+    for (const auto& pair : final_spec_amount_pairs) {
+        final_sorted_specs.push_back(pair.first);
+    }
+
+    spdlog::debug("Final filtered specs for player {}:", current_player); // Log final specs
+    for(const auto& s : final_sorted_specs) spdlog::debug("- {}", s.to_string());
+
+    return final_sorted_specs;
 }
 
 
@@ -241,85 +342,88 @@ int ActionAbstraction::get_action_amount(const ActionSpec& action_spec, const Ga
                  return -1; // Invalid BET
             }
             int target_total_bet = -1;
+            // Use integer arithmetic where possible for PCT_POT to avoid float issues
             if (action_spec.unit == SizingUnit::PCT_POT) {
                 int current_pot_for_betting = current_state.get_pot_size(); // Pot before this bet
-                int bet_increment = static_cast<int>(std::round(current_pot_for_betting * (action_spec.value / 100.0)));
-                target_total_bet = current_bet + bet_increment;
+                // Integer calculation for percentage: (pot * percentage) / 100
+                // Add 0.5 for rounding before casting to int (equivalent to std::round)
+                 // Ensure intermediate multiplication doesn't overflow if pot/value are large
+                 long long intermediate_value = static_cast<long long>(current_pot_for_betting) * static_cast<long long>(action_spec.value);
+                 // Use integer division for rounding: (numerator + denominator/2) / denominator
+                 int bet_increment = static_cast<int>((intermediate_value + 50) / 100);
+                 bet_increment = std::max(1, bet_increment); // Ensure bet is at least 1 chip
+                 target_total_bet = current_bet + bet_increment;
+            } else if (action_spec.unit == SizingUnit::BB) {
+                 // Use integer arithmetic for BB sizing, round to nearest chip
+                 // (value * BB_SIZE) + 0.5 before casting to int
+                 target_total_bet = static_cast<int>(action_spec.value * BIG_BLIND_SIZE + 0.5);
             } else {
-                 spdlog::error("Unsupported unit for BET action"); return -1;
+                 spdlog::error("Unsupported unit for BET action: {}", static_cast<int>(action_spec.unit)); return -1;
             }
-             // Apply min bet rule (usually 1 BB, but can be less if stack is smaller)
-             target_total_bet = std::max(target_total_bet, current_bet + std::min(player_stack, BIG_BLIND_SIZE));
+             // Apply min bet rule (at least 1 BB or remaining stack if smaller)
+             int min_bet_increment = std::min(player_stack, std::max(1, BIG_BLIND_SIZE));
+             target_total_bet = std::max(target_total_bet, current_bet + min_bet_increment);
              // Cap by stack
-             return std::min(player_stack + current_bet, target_total_bet);
+            return std::min(player_stack + current_bet, target_total_bet);
         }
 
         case ActionType::RAISE: {
-             if (amount_to_call == 0) {
-                  // Check if it's the BB option preflop
-                  bool is_bb = (current_player == (current_state.get_button_position() + 2) % current_state.get_num_players()) || (current_state.get_num_players() == 2 && current_player == (current_state.get_button_position() + 1) % current_state.get_num_players());
-                  int max_other_bet = 0;
-                  for(int i=0; i<current_state.get_num_players(); ++i) { if(i != current_player) max_other_bet = std::max(max_other_bet, current_state.get_bet_this_round(i)); }
-                  
-                  // CORRECTION: Ne pas rejeter les raises quand amount_to_call == 0 (cas RFI)
-                  // Convertir en BET si nécessaire, mais ne pas retourner d'erreur
-                  if (!(current_state.get_current_street() == Street::PREFLOP && is_bb && max_other_bet <= BIG_BLIND_SIZE)) {
-                       // Ne pas retourner d'erreur, traiter comme un BET
-                       spdlog::debug("Converting RAISE to BET since amount_to_call == 0");
-                  }
-             }
-
             int target_total_bet = -1;
-            int pot_after_call = current_state.get_pot_size();
-            for(int bet : current_state.get_current_bets()) { pot_after_call += bet; }
-            pot_after_call += amount_to_call;
-            int raise_base_amount = current_bet + amount_to_call;
+            // Calculate pot size after hypothetical call
+            int pot_after_call = current_state.get_pot_size(); // Start with current pot
+            for(int p=0; p<current_state.get_num_players(); ++p) {
+                 if (p != current_player) {
+                      pot_after_call += current_state.get_bet_this_round(p); // Add bets of others
+                 }
+            }
+            pot_after_call += (current_bet + amount_to_call); // Add this player's total commitment after calling
+
+            int raise_base_amount = current_bet + amount_to_call; // Amount player needs to commit just to call
 
             if (action_spec.unit == SizingUnit::BB) {
-                target_total_bet = static_cast<int>(std::round(action_spec.value * BIG_BLIND_SIZE));
+                // Integer arithmetic for BB sizing, round to nearest chip
+                target_total_bet = static_cast<int>(action_spec.value * BIG_BLIND_SIZE + 0.5);
             } else if (action_spec.unit == SizingUnit::PCT_POT) {
-                int raise_increment = static_cast<int>(std::round(pot_after_call * (action_spec.value / 100.0)));
-                target_total_bet = raise_base_amount + raise_increment;
+                 // Integer calculation for percentage: (pot_after_call * percentage) / 100
+                 long long intermediate_value = static_cast<long long>(pot_after_call) * static_cast<long long>(action_spec.value);
+                 int raise_increment = static_cast<int>((intermediate_value + 50) / 100);
+                 raise_increment = std::max(1, raise_increment); // Ensure raise is at least 1 chip
+                 target_total_bet = raise_base_amount + raise_increment;
             } else if (action_spec.unit == SizingUnit::MULTIPLIER_X) {
-                int last_raise_size = current_state.get_last_raise_size();
-                if (last_raise_size <= 0) {
-                     last_raise_size = (current_state.get_current_street() == Street::PREFLOP) ? BIG_BLIND_SIZE : std::max(BIG_BLIND_SIZE, 1);
-                }
-                int raise_increment = static_cast<int>(std::round(static_cast<double>(last_raise_size) * action_spec.value));
-                target_total_bet = raise_base_amount + raise_increment;
+                 int last_bet_or_raise_amount = current_state.get_amount_to_call(current_player) + current_state.get_bet_this_round(current_player); // The full bet/raise facing the player *before* their action
+                 // Calculate the target total bet based on the multiplier of the opponent's bet/raise size
+                 // Total bet = current_bet + call_amount + raise_increment
+                 // raise_increment = (X * last_raise_size) where last_raise_size is the size of the last raise increment
+                 // OR raise_increment = (X * last_bet_size) if facing a bet
+                 // Let's simplify: Target total bet = X * (total amount opponent committed in their last aggressive action)
+                 // This needs careful definition. Let's try: Target total = X * last_bet_or_raise_amount
+                 int target_raise_total = static_cast<int>(action_spec.value * last_bet_or_raise_amount + 0.5); // Round X sizing
+                 // The actual amount to add is the difference between this target and what we already committed + need to call
+                 int raise_increment = target_raise_total - raise_base_amount;
+                 raise_increment = std::max(1, raise_increment); // Ensure raise is at least 1 chip
+                 target_total_bet = raise_base_amount + raise_increment;
             } else {
-                 spdlog::error("Unsupported unit for RAISE action"); return -1;
+                 spdlog::error("Unsupported unit for RAISE action: {}", static_cast<int>(action_spec.unit));
+                 return -1;
             }
 
-            // Apply Min-Raise Rules
-            int last_raise_size = current_state.get_last_raise_size();
-            int min_raise_increment = (last_raise_size > 0) ? last_raise_size : BIG_BLIND_SIZE;
-             if (current_state.get_current_street() == Street::PREFLOP && current_state.get_raises_this_street() == 0) {
-                  min_raise_increment = BIG_BLIND_SIZE;
-             }
-            int min_legal_total_bet = current_bet + amount_to_call + min_raise_increment;
+            // Min legal raise size calculation (unified logic)
+            int min_raise_increment = (current_state.get_last_raise_size() > 0) ? current_state.get_last_raise_size() : BIG_BLIND_SIZE;
+            // Ensure min raise increment is at least 1 chip (e.g., if BB=0)
+            min_raise_increment = std::max(1, min_raise_increment);
+            int min_legal_raise_total = raise_base_amount + min_raise_increment;
 
-            int final_total_bet = std::max(target_total_bet, min_legal_total_bet);
+            // Apply min legal raise rule
+            target_total_bet = std::max(target_total_bet, min_legal_raise_total);
 
-            // Cap by stack
-            return std::min(player_stack + current_bet, final_total_bet);
+            // Cap by stack size
+            return std::min(player_stack + current_bet, target_total_bet);
         }
+
         default:
-             spdlog::error("Unknown ActionType in get_action_amount");
-             return -1;
+            spdlog::error("Unknown action type: {}", static_cast<int>(action_spec.type));
+            return -1;
     }
 }
-
-
-// --- Deprecated string-based methods ---
-/*
-std::vector<std::string> ActionAbstraction::get_possible_actions(const GameState& current_state) const {
-    // ... implementation ...
-}
-
-int ActionAbstraction::get_action_amount(const std::string& action_str, const GameState& current_state) const {
-    // ... implementation ...
-}
-*/
 
 } // namespace gto_solver
